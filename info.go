@@ -36,6 +36,12 @@ type Info struct {
 	// mode, WithoutAutoTune, or no permission to write /sys). See
 	// WithoutAutoTune — these are host settings, so they are worth seeing.
 	Tuning string
+	// Affinity describes the CPU placement, e.g. "4/4 workers pinned
+	// (following driver hints)", or "off" when disabled. Workers count as
+	// pinned once their goroutine has touched the datapath, so read this
+	// after traffic has started if you want the final answer. See
+	// WithoutAffinity.
+	Affinity string
 }
 
 // Info gathers a snapshot describing how the Fleet is running. The zero-copy
@@ -52,6 +58,7 @@ func (f *Fleet) Info() (Info, error) {
 		NumFrames: f.opts.NumFrames,
 		Filter:    f.filter,
 		Tuning:    f.tuning.String(),
+		Affinity:  f.affinity.String(),
 		XDPMode:   "unknown",
 	}
 
@@ -89,6 +96,9 @@ func (i Info) String() string {
 	}
 	if i.Tuning != "" {
 		s += ", napi " + i.Tuning
+	}
+	if i.Affinity != "" {
+		s += ", affinity " + i.Affinity
 	}
 	return s
 }

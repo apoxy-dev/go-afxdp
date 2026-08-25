@@ -67,10 +67,14 @@ func (xsk *Socket) multiBuffer() bool {
 // The returned slice and the Descs it points at are owned by the Socket and
 // reused on the next call; copy out anything you need to keep. Return the
 // frames with RecyclePackets when done.
+//
+// The first call from a given goroutine also locks that goroutine to its OS
+// thread and moves it onto this queue's CPU; see Pin.
 func (xsk *Socket) ReceivePackets(maxFrames int) []Packet {
 	if !xsk.incref() {
 		return nil
 	}
+	xsk.autoPin()
 	defer xsk.decref()
 
 	descs := xsk.Receive(maxFrames)
@@ -139,6 +143,7 @@ func (xsk *Socket) sendBatchSG(payloads [][]byte) (int, error) {
 	if !xsk.incref() {
 		return 0, net.ErrClosed
 	}
+	xsk.autoPin() // the one transmit path that never reaches Transmit
 	defer xsk.decref()
 
 	xsk.Complete(xsk.NumCompleted()) // reclaim already-sent frames

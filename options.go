@@ -8,6 +8,8 @@
 package afxdp
 
 import (
+	"fmt"
+	"runtime"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -171,6 +173,14 @@ type config struct {
 	noAutoTune    bool
 	napiDeferIRQs int
 	napiFlush     time.Duration
+
+	// Auto-affinity (see WithoutAffinity). noAffinity disables it;
+	// affinityCPUs is nil unless WithAffinity named the CPUs to use;
+	// affinityErr carries a rejected CPU list out to Open, since an option
+	// cannot fail on its own.
+	noAffinity   bool
+	affinityCPUs []int
+	affinityErr  error
 }
 
 // xdpMode selects how Open attaches the XDP program and binds the sockets.
@@ -430,13 +440,79 @@ func WithoutAutoTune() Option { return func(c *config) { c.noAutoTune = true } }
 
 // WithNAPITuning overrides the auto-tuning values. deferIRQs sets
 // napi_defer_hard_irqs and flush sets gro_flush_timeout; the defaults are 2 and
-// 200µs. Raising them further batches harder but risks the NIC dropping because
-// NAPI stops running often enough — at 10 and 500µs our 100G sink fell from
-// 118.8 to 77 Mpps with 29M discards a second. See WithoutAutoTune.
+// 20µs.
+//
+// A longer flush batches harder and costs less CPU, but it is also a ceiling on
+// how fast one queue can be drained — roughly a thousand packets per flush
+// interval, so about 5 Mpps per queue at 200µs. Raise it only if you know your
+// per-queue packet rate stays under that: on a 100G NIC offering 132 Mpps
+// across 8 queues, 200µs delivered 43 Mpps where 20µs delivered 132. Across 48
+// queues, where each one takes 2.7 Mpps, the same 200µs costs nothing and saves
+// a further 4 cores. See WithoutAutoTune and tune.go for the full table.
 func WithNAPITuning(deferIRQs int, flush time.Duration) Option {
 	return func(c *config) {
 		c.napiDeferIRQs = deferIRQs
 		c.napiFlush = flush
+	}
+}
+
+// WithoutAffinity leaves CPU placement entirely to the scheduler and the
+// interrupts exactly where it found them.
+//
+// By default a Fleet colocates each queue with its worker: it works out which
+// CPU that queue's NIC interrupt is on, and the goroutine driving the queue is
+// locked to a core beside it the first time it calls any of Poll, Receive,
+// ReceivePackets, Transmit, SendFunc or SendBatch. When the interrupts are somewhere unusable — irqbalance has
+// scattered them, or several queues share a core — the interrupt is moved to a
+// free core instead and restored when the Fleet closes. A transmit-only fleet
+// (WithFilter(MatchNone())) is placed on its interrupts rather than beside
+// them, since no receive softirq is competing for the core; that is what lets a
+// generator drive a queue per core instead of per pair.
+//
+// It is worth doing because a queue whose two halves sit on different cores
+// pays a cache miss on every packet. On a 100G ConnectX-6 Dx one transmit
+// worker moved 15.0 Mpps using 1.01 cores when it shared a core with its
+// interrupt, and 6.2 Mpps using 2.01 cores when the interrupt was on a
+// different L3 complex — 2.4x the packets for half the CPU. See affinity.go
+// for the full table.
+//
+// Use this option if you place threads yourself, if something else on the box
+// owns the interrupt routing, or if your worker goroutine does more than drive
+// the socket and should not be tied to one core. Locking is also skipped
+// automatically for a goroutine that already drives another queue, and pinning
+// that the kernel refuses (a taskset or cpuset that excludes the CPU) is
+// treated as the operator being more specific than us and left alone.
+func WithoutAffinity() Option { return func(c *config) { c.noAffinity = true } }
+
+// WithAffinity names the CPUs to run the queue workers on: queue q gets
+// cpus[q % len(cpus)], and that queue's interrupt is steered to a core beside
+// it — never onto it, for the reason in WithoutAffinity — and restored on
+// Close. Passing a CPU that does not exist on this machine makes Open fail
+// rather than silently leave the queue unplaced. Use it when the machine is partitioned and the
+// automatic choice would land on cores that belong to something else. Passing
+// no CPUs is the same as WithoutAffinity.
+//
+// Choose full physical cores on the NIC's NUMA node. An SMT sibling is not a
+// second core's worth of packets, and a core on the wrong node — or in the
+// wrong L3 complex on chiplet CPUs like EPYC — costs more than not pinning at
+// all.
+func WithAffinity(cpus ...int) Option {
+	return func(c *config) {
+		if len(cpus) == 0 {
+			c.noAffinity = true
+			return
+		}
+		// Validate here rather than let a bad number turn into a silently
+		// empty CPU mask. unix.CPUSet.Set ignores an out-of-range CPU and
+		// turns a negative one into a completely unrelated bit, either of
+		// which would leave the queue unpinned with nothing to show why.
+		for _, cpu := range cpus {
+			if cpu < 0 || cpu >= runtime.NumCPU() {
+				c.affinityErr = fmt.Errorf("afxdp: WithAffinity: cpu %d is out of range for a machine with %d processors", cpu, runtime.NumCPU())
+				return
+			}
+		}
+		c.affinityCPUs = append([]int(nil), cpus...)
 	}
 }
 

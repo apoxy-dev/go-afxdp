@@ -665,6 +665,18 @@ func MatchAll() Match {
 	}}
 }
 
+// anyRedirect reports whether any of these matches can redirect a packet. A set
+// that cannot needs no redirect block in the program, and marks the fleet as
+// transmit-only for CPU placement — see transmitOnly.
+func anyRedirect(matches []Match) bool {
+	for _, m := range matches {
+		if !m.passOnly {
+			return true
+		}
+	}
+	return false
+}
+
 // MatchNone matches nothing: every packet is passed to the kernel, none is
 // redirected. On its own (afxdp.WithFilter(afxdp.MatchNone())) it attaches the
 // XDP program — which is what enables a driver's zero-copy datapath — without
@@ -809,14 +821,7 @@ func newFilterProgram(maxQueues int, exceptions, matches []Match, frags bool) (*
 	// driver for a transmit-only program — but redirects nothing and needs no
 	// maps. (A redirect block with nothing jumping to it is unreachable code,
 	// which the verifier rejects.)
-	anyRedirect := false
-	for _, m := range matches {
-		if !m.passOnly {
-			anyRedirect = true
-			break
-		}
-	}
-	if !anyRedirect {
+	if !anyRedirect(matches) {
 		prog, err := ebpf.NewProgram(&ebpf.ProgramSpec{
 			Name:         "xsk_pass",
 			Type:         ebpf.XDP,

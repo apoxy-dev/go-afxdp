@@ -30,6 +30,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -49,6 +50,10 @@ func main() {
 	vlan := flag.Int("vlan", 0, "802.1Q VLAN ID to tag frames with (0 = untagged)")
 	queues := flag.Int("queues", 0, "tx queues to use (0 = all)")
 	duration := flag.Duration("duration", 10*time.Second, "how long to blast (0 = until Ctrl-C)")
+	noAffinity := flag.Bool("no-affinity", false,
+		"leave CPU placement to the scheduler instead of colocating each worker with its queue's interrupt (see WithoutAffinity)")
+	cpus := flag.String("cpus", "",
+		"run the workers on these processors instead of the ones chosen automatically, e.g. 4,6,8 or 4-7 (see WithAffinity)")
 	flag.Parse()
 
 	if *dstIP == "" {
@@ -75,10 +80,19 @@ func main() {
 
 	// Attach a no-op program (MatchNone) so we get the zero-copy TX datapath
 	// without stealing any receive traffic, and bind one socket per queue.
-	fleet, err := afxdp.Open(*iface,
+	opts := []afxdp.Option{
 		afxdp.WithFilter(afxdp.MatchNone()),
 		afxdp.WithQueues(*queues),
-	)
+	}
+	if *noAffinity && *cpus != "" {
+		log.Fatal("-no-affinity and -cpus contradict each other: pick one")
+	}
+	if *noAffinity {
+		opts = append(opts, afxdp.WithoutAffinity())
+	} else if *cpus != "" {
+		opts = append(opts, afxdp.WithAffinity(parseCPUs(*cpus)...))
+	}
+	fleet, err := afxdp.Open(*iface, opts...)
 	if err != nil {
 		log.Fatalf("open: %v", err)
 	}
@@ -110,6 +124,12 @@ func main() {
 			blast(xsk, template, srcPortOff, uint16(1024+i*64), &bytes, &stop)
 		}(i, xsk)
 	}
+	// Workers pin themselves to their queue's interrupt core on their first
+	// trip through the datapath, so where they landed is only knowable once
+	// they are running.
+	time.Sleep(200 * time.Millisecond)
+	log.Printf("cpu affinity: %v", fleet.Affinity())
+
 	wg.Add(1)
 	go func() { defer wg.Done(); report(fleet, &bytes, &stop) }()
 
@@ -300,4 +320,32 @@ func pickDstMAC(link netlink.Link, dstIP net.IP, override string) net.HardwareAd
 	log.Fatalf("no ARP entry for %s on %s — ping it first, or pass -dst-mac",
 		dstIP, link.Attrs().Name)
 	return nil
+}
+
+// parseCPUs reads a processor list in the kernel's own "4,6,8" or "4-7" form.
+// The range is bounded: an accidental "0-2000000000" would otherwise ask for a
+// slice of sixteen billion bytes, as root.
+func parseCPUs(s string) []int {
+	const maxRange = 4096
+	var out []int
+	for _, part := range strings.Split(s, ",") {
+		lo, hi, isRange := strings.Cut(strings.TrimSpace(part), "-")
+		start, err := strconv.Atoi(lo)
+		if err != nil {
+			log.Fatalf("bad -cpus %q", s)
+		}
+		end := start
+		if isRange {
+			if end, err = strconv.Atoi(hi); err != nil {
+				log.Fatalf("bad -cpus %q", s)
+			}
+		}
+		if start < 0 || end < start || end-start > maxRange {
+			log.Fatalf("bad -cpus %q: %d-%d is not a usable processor range", s, start, end)
+		}
+		for c := start; c <= end; c++ {
+			out = append(out, c)
+		}
+	}
+	return out
 }

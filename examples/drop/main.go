@@ -40,6 +40,10 @@ func main() {
 	queues := flag.Int("queues", 0, "rx queues to bind (0 = all)")
 	all := flag.Bool("all", false, "capture every packet instead of just -port")
 	noTune := flag.Bool("no-autotune", false, "leave the interface's NAPI settings alone (see WithoutAutoTune)")
+	noAffinity := flag.Bool("no-affinity", false,
+		"leave CPU placement to the scheduler instead of colocating each worker with its queue's interrupt (see WithoutAffinity)")
+	cpus := flag.String("cpus", "",
+		"run the workers on these processors instead of the ones chosen automatically, e.g. 4,6,8 or 4-7 (see WithAffinity)")
 	keepMgmt := flag.Bool("keep-management", false,
 		"with -all, leave ARP/ND/SSH/DNS with the kernel so you keep your session")
 	flag.Parse()
@@ -55,6 +59,14 @@ func main() {
 	opts := []afxdp.Option{filter, afxdp.WithQueues(*queues), afxdp.WithReceiveHeavy()}
 	if *noTune {
 		opts = append(opts, afxdp.WithoutAutoTune())
+	}
+	if *noAffinity && *cpus != "" {
+		log.Fatal("-no-affinity and -cpus contradict each other: pick one")
+	}
+	if *noAffinity {
+		opts = append(opts, afxdp.WithoutAffinity())
+	} else if *cpus != "" {
+		opts = append(opts, afxdp.WithAffinity(parseCPUs(*cpus)...))
 	}
 	if *keepMgmt {
 		// Only meaningful with -all: capturing everything on the interface you
@@ -89,6 +101,12 @@ func main() {
 	for _, xsk := range fleet.Sockets() {
 		go drop(xsk, &bytes)
 	}
+
+	// Workers pin themselves to their queue's interrupt core on their first
+	// trip through the datapath, so where they landed is only knowable once
+	// they are running.
+	time.Sleep(200 * time.Millisecond)
+	log.Printf("cpu affinity: %v", fleet.Affinity())
 
 	go report(fleet, &bytes, *iface)
 
@@ -212,4 +230,32 @@ func readMissed(iface string) uint64 {
 	}
 	v, _ := strconv.ParseUint(strings.TrimSpace(string(data)), 10, 64)
 	return v
+}
+
+// parseCPUs reads a processor list in the kernel's own "4,6,8" or "4-7" form.
+// The range is bounded: an accidental "0-2000000000" would otherwise ask for a
+// slice of sixteen billion bytes, as root.
+func parseCPUs(s string) []int {
+	const maxRange = 4096
+	var out []int
+	for _, part := range strings.Split(s, ",") {
+		lo, hi, isRange := strings.Cut(strings.TrimSpace(part), "-")
+		start, err := strconv.Atoi(lo)
+		if err != nil {
+			log.Fatalf("bad -cpus %q", s)
+		}
+		end := start
+		if isRange {
+			if end, err = strconv.Atoi(hi); err != nil {
+				log.Fatalf("bad -cpus %q", s)
+			}
+		}
+		if start < 0 || end < start || end-start > maxRange {
+			log.Fatalf("bad -cpus %q: %d-%d is not a usable processor range", s, start, end)
+		}
+		for c := start; c <= end; c++ {
+			out = append(out, c)
+		}
+	}
+	return out
 }

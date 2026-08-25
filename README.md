@@ -141,25 +141,100 @@ ConnectX (`mlx5_core`) with 48 combined queues, native XDP and zero-copy on both
 ends. [`examples/blast`](examples/blast) on one, [`examples/drop`](examples/drop)
 on the other, over a tagged VLAN.
 
-| frame size | sent | received | TX cores | RX cores |
-| --- | --- | --- | --- | --- |
-| 1500 B | 8.20 Mpps, 99.9 Gbit/s | 8.18 Mpps, 99.7 Gbit/s, no drops | 18 | 17 |
-| 64 B | 140 Mpps, 98.5 Gbit/s | 119 Mpps, 83.6 Gbit/s | 23 | 21 |
+| wire frame | line rate | transmit | receive |
+| --- | --- | --- | --- |
+| 64 B | 148.8 Mpps | 147.8 Mpps, 99.3 Gbit/s — 16 queues, 16.0 cores | 148.4 Mpps, no drops — 8 queues, 9.3 cores |
+| 128 B | 84.5 Mpps | 84.0 Mpps, 99.5 Gbit/s — 16 queues, 16.0 cores | 84.4 Mpps, no drops — 4 queues, 5.6 cores |
+| 512 B | 23.5 Mpps | 23.5 Mpps, 100.1 Gbit/s — 4 queues, 4.0 cores | 23.5 Mpps, no drops — 1 queue, 1.3 cores |
+| 1500 B | 8.2 Mpps | 8.2 Mpps, 99.9 Gbit/s — 4 queues, 4.0 cores | 8.2 Mpps, no drops — 1 queue, 0.9 cores |
 
-With 1500-byte frames this fills a 100G link in both directions and loses nothing.
+**Line rate in both directions at every frame size**, on one 100G port, with the
+defaults and no drops anywhere. Frames are as they appear on the wire, FCS
+included; `blast` takes four less than that, since its `-size` excludes the FCS
+the NIC appends.
 
-With 64-byte frames the sender reaches about 98% of line rate. The receiver takes
-119 Mpps of it and the missing 21 Mpps never reach the rings: the receiving NIC
-discards them itself (`rx_discards_phy`) because it cannot DMA into host memory
-that fast. The wire delivered 100.00% of what was sent, our fill ring ran dry
-7,033 times out of 3.5 billion packets, and nothing was dropped at the application
-level — so that ceiling is the card's, not this library's.
+Bigger frames cost less, as they should: the work here is per packet, not per
+byte, so a 1500-byte line rate of 8.2 Mpps is eighteen times less work than a
+64-byte line rate of 148.8. Receive at 1500 bytes fills the wire with **under a
+core**; at 64 bytes it needs 9.3 of 48.
 
-Cores are userspace CPU of the example process on a 48-thread box; driver and
-softirq work sits on top (the machines ran 80–99% busy at these rates). Packet
-generation is included in the TX figure and is a small part of it: a variant of
-`blast` with the frames pre-built uses 22.0 cores instead of 22.8, so building
-each packet costs roughly 3% of the send path.
+The two sides are measured differently, and the difference matters:
+
+- **Receive cores are work.** The sink blocks in `poll` when there is nothing to
+  do, so its CPU is what the packets actually cost. Every processor on the
+  machine is counted — userspace and softirq together — which is the honest way
+  to measure a path that does half its work in the kernel.
+- **Transmit cores are occupancy.** A generator busy-polls: `blast` loops on
+  `SendFunc`, so a worker whose transmit ring is full spins, and a spinning core
+  is indistinguishable from a busy one in every CPU metric. It occupies one core
+  per queue whatever the frame size, which is why the transmit column always
+  reads "N queues, N cores". At 1500 bytes those four cores are nearly idle —
+  a single queue at 512 bytes already reaches 96.1 Gbit/s, and two at 1500 bytes
+  reach 94.5.
+
+**Transmit is not more expensive per packet than receive** — the columns above
+only make it look that way. Measured where neither side is spinning, transmitting
+a 64-byte frame costs **288 cycles** and receiving one costs **270**: within 7% of
+each other.
+
+What differs is how much a single queue can carry. A transmit queue tops out near
+15 Mpps, and that is the *queue's* limit rather than the core's — giving one queue
+a second core raises it only from 14.1 to 16.2 Mpps. A receive queue carries about
+34 Mpps. So the same 148 Mpps needs sixteen queues one way and eight the other,
+and since a busy-polling generator occupies a core per queue, the queue count is
+what sets the transmit column.
+
+The last fifth is also the expensive part: eight transmit queues already reach
+**119.7 Mpps on 8 cores** (14.9 Mpps per core, the same efficiency as receive).
+The eight further queues that take it to line rate add only 28 Mpps, because by
+then the wire, not the CPU, is what is left to fight.
+
+### Why 128-byte transmit costs more than 64-byte
+
+The table has an oddity worth explaining, because it looks like an error: sending
+84 Mpps of 128-byte frames takes the same sixteen queues as 148 Mpps of 64-byte
+ones, while receiving them takes four. Bigger frames should be *easier*.
+
+They are — for the wire and for the receiver. It is transmit that has a hole in
+it, and it belongs to the driver rather than to this library. Sweeping frame size
+on a single transmit queue:
+
+| wire frame | 64 B | 72 B | 96 B | 128 B | 192 B | 256 B | 384 B | 512 B | 1024 B |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Gbit/s | 9.4 | 6.2 | 5.7 | 5.2 | 4.8 | 4.7 | **79.0** | 96.9 | 77.2 |
+
+From roughly 72 to 256 bytes one queue is stuck near 5 Gbit/s, and then jumps
+sixteenfold at 384. The reason is that mlx5 copies a small frame *into* the
+transmit descriptor instead of pointing at it, so what runs out is the card's
+descriptor bandwidth — and that gets worse as the frame grows, which is why the
+rate falls with size instead of rising. Above the driver's inline threshold the
+descriptor becomes a pointer and the wire takes over again.
+
+That is measurable rather than inferred. Driving the same card through
+[packetio](https://github.com/atoonk/packetio), where the descriptor format is
+ours to choose, one queue at a time:
+
+| one transmit queue | 64 B | 128 B | 256 B |
+| --- | --- | --- | --- |
+| packet copied into the descriptor | 16.9 Mpps | **8.8 Mpps** | — |
+| descriptor points at the packet | 18.5 Mpps | **18.6 Mpps** | 18.5 Mpps |
+
+Pointing gives a flat packets-per-second ceiling that does not care about frame
+size, which is what a queue limit should look like. Copying halves it at 128
+bytes.
+
+**Receive has no equivalent**, which is the whole of the asymmetry in the table
+above: the card DMAs straight into a buffer the driver posted in advance, so
+nothing is copied per frame and the frame size costs nothing.
+
+Copying is not simply the wrong choice, though — it is what makes 64-byte line
+rate possible at all. Pointer descriptors cap the *whole card* near 74 Mpps no
+matter how many queues you give them, where copying reaches 148. It is only the
+middle sizes where the trade goes the wrong way, and where that threshold sits is
+the kernel driver's decision, not something an AF_XDP application can reach.
+
+Do not compare these to the per-queue table below, which counts userspace CPU
+only and predates the CPU placement.
 
 ### Scaling per queue
 
@@ -183,6 +258,10 @@ Transmit scales linearly at about **13.6 Mpps per core** and reaches line rate a
 driver's NAPI poll and the XDP redirect — runs in softirq, not in the process;
 a single queue tops out near 7.7 Mpps while our loop consumes it with half a core.
 
+These numbers predate the automatic CPU placement described below, and were
+taken with the workers left to the scheduler; see
+[CPU affinity](#cpu-affinity-done-for-you) for the same box measured both ways.
+
 **More queues is not better.** Past 16 nothing gets faster — transmit is at line
 rate and receive is at the NIC's limit — but the receiver keeps costing more CPU.
 Measured box-wide, 16 queues carried 116 Mpps using 19.5 of 48 cores, while 48
@@ -199,19 +278,39 @@ and interrupt dispatch at the top, with the functions that actually move packets
 (`__xsk_map_redirect`, `__xsk_rcv_zc`) nowhere near it.
 
 **`Open` fixes this for you.** On a native-mode NIC it sets
-`napi_defer_hard_irqs=2` and `gro_flush_timeout=200µs` so the kernel lets packets
-accumulate, and restores your previous values on `Close`. Same traffic, same
-118.8 Mpps, on the 100G Mellanox sink:
+`napi_defer_hard_irqs=2` and `gro_flush_timeout=20µs` so the kernel lets packets
+accumulate, and restores your previous values on `Close`. Taking everything on the
+wire from a sender offering 132 Mpps of 64-byte frames, across 48 queues:
 
-| | packets per poll | polls/s | box busy |
-| --- | --- | --- | --- |
-| kernel default | 39 | 3.0M | 36.5 of 48 cores |
-| what `Open` applies | 92 | 1.3M | **24.2 of 48 cores** |
+| | packets per poll | polls/s | kept | box busy |
+| --- | --- | --- | --- | --- |
+| kernel default | 21 | 5.4M | 114.7 Mpps | 29.4 of 48 cores |
+| what `Open` applies | 53 | 2.5M | **130.6 Mpps** | **14.1 of 48 cores** |
 
-Same throughput for **about a third less of the machine**, which is why this is on
-by default rather than a tuning tip. (A trivial filter that does no per-packet
-work benefits even more; the numbers above are a realistic UDP sink.)
-`Fleet.Info()` reports it (`napi defer=2 flush=200µs`) so it is never invisible.
+More throughput for **half the machine**, which is why this is on by default
+rather than a tuning tip. `Fleet.Info()` reports it (`napi defer=2 flush=20µs`)
+so it is never invisible.
+
+**The flush timeout is a speed limit, so keep it short.** It is not only a
+batching hint: a queue delivers about a thousand packets per flush interval and
+no more, whatever is offered — roughly 5 Mpps per queue at 200µs, which is a
+third of what one queue can actually do. Spread thin across 48 queues that
+ceiling is invisible; concentrated on 8 it is brutal. Same NIC, same 132 Mpps
+offered, packets kept and whole-machine cores:
+
+| flush | 8 queues | 16 queues | 24 queues | 48 queues |
+| --- | --- | --- | --- | --- |
+| none | 132.2, 9.9c | 132.1, 9.0c | 131.2, 15.6c | 114.7, 29.4c |
+| **20µs** | **132.2, 9.2c** | **132.2, 9.7c** | **132.1, 12.6c** | **130.6, 14.1c** |
+| 50µs | 123.7, 7.2c | 132.2, 9.2c | 132.0, 11.4c | 130.4, 11.6c |
+| 100µs | 78.4, 4.0c | 122.3, 7.3c | 132.0, 10.6c | 130.3, 10.2c |
+| 200µs | 43.1, 1.9c | 68.9, 3.9c | 103.4, 8.4c | 130.2, 9.7c |
+
+Every step down that table buys CPU by lowering the ceiling. 20µs puts it near
+50 Mpps per queue — above anything a single queue reaches — so it costs nothing
+at any queue count while still halving the machine at 48. Versions of this
+library before this measurement defaulted to 200µs, which was tuned at 48 queues
+and silently capped everything below that.
 
 Worth knowing, since these are properties of the interface rather than of your
 process:
@@ -223,9 +322,9 @@ process:
   so it trades a little idle latency for a lot of loaded throughput.
 - Generic/SKB mode is never touched, so veth and test setups are unaffected.
 - Opt out with `WithoutAutoTune()`, or change the values with
-  `WithNAPITuning(deferIRQs, flush)`. Do not raise them much: at `10` and `500µs`
-  the same sink fell to 77 Mpps with 29M discards a second, because NAPI stopped
-  running often enough.
+  `WithNAPITuning(deferIRQs, flush)`. Raise the flush only if you know your
+  per-queue packet rate stays under the ceiling above: with many thin queues a
+  longer flush is free CPU, and with a few busy ones it is a cliff.
 
 Interrupt coalescing (`ethtool -C rx-usecs`) does *not* substitute for this —
 most wakeups here are NAPI flushes rather than hardware interrupts, so raising
@@ -235,6 +334,115 @@ One curiosity this explains: untuned, throughput becomes oddly sensitive to how
 long the XDP program takes, and a filter that reads packet headers batches better
 — and so runs *faster* — than one that does nothing. Tuned, that inversion
 disappears and the simplest program is the cheapest, as it should be.
+
+### CPU affinity (done for you)
+
+A queue is two halves. The kernel half — the hardware interrupt, the NAPI poll,
+your XDP program, the redirect into the socket — runs wherever that queue's
+interrupt is routed. The userspace half — your goroutine calling `Poll`,
+`Receive`, `SendFunc` — runs wherever the Go scheduler happens to put it. Left
+alone the two land on unrelated cores, and every packet then crosses a cache
+boundary that it did not have to.
+
+On a chiplet CPU that is expensive. One transmit worker, one queue, interrupt on
+core 0, worker moved by hand (EPYC 9275F: 24 cores in L3 complexes of 3, SMT
+siblings *n* and *n*+24):
+
+| worker on | | Mpps | cores |
+| --- | --- | --- | --- |
+| core 1 | same complex, another core | **16.3** | 2.0 |
+| core 24 | the interrupt's SMT sibling | 16.2 | 2.0 |
+| core 0 | the interrupt's own core | 15.0 | 1.0 |
+| core 12 | a different complex | 6.2 | 2.0 |
+
+Leaving the complex costs 2.6× the throughput for the same CPU — and on a
+24-core chiplet CPU an unplaced goroutine lands outside the right complex almost
+every time.
+
+**`Open` places them for you.** It finds each queue's interrupt and locks the
+goroutine driving that queue to a core beside it — the first time that goroutine
+calls `Poll`, `Receive`, `ReceivePackets`, `Transmit`, `SendFunc` or `SendBatch`,
+which is the moment it identifies itself as that queue's worker. Interrupts with
+no free core beside them are moved to one, and put back on `Close`.
+
+A **generator** — `WithFilter(MatchNone())`, which never receives — is placed
+*on* its interrupts instead, for the reason below. Transmitting 64-byte frames,
+whole-machine CPU, everything else identical:
+
+| queues | before | after |
+| --- | --- | --- |
+| 1 | 6.5 Mpps, 2.0 cores | **14.3 Mpps**, 1.0 core |
+| 4 | 33.0 Mpps, 8.0 cores | **59.6 Mpps**, 4.0 cores |
+| 8 | 55.2 Mpps, 16.0 cores | **118.7 Mpps**, 8.0 cores |
+| 16 | 112.2 Mpps, 32.1 cores | **147.8 Mpps**, 16.0 cores |
+| 24 | 145.9 Mpps, 45.9 cores | 148.5 Mpps, 24.1 cores |
+
+Twice the packets for half the CPU, 1300 cycles per packet down to 290, and at
+16 queues 99.3 Gbit/s — 64-byte line rate on sixteen logical CPUs, which is
+eight physical cores, or **18.5 Mpps per physical core**. This library did not
+reach line rate at all before. The run-to-run spread goes too: the unplaced arm
+wandered between 12.9 and 31.0 Mpps at two queues depending on where the
+scheduler happened to put things, the placed one between 29.4 and 29.5.
+
+Receiving, with a sender offering 132 Mpps of 64-byte frames the receiver is
+free to drop (that was the generator's ceiling, not the receiver's — fed a full
+148.7 Mpps the placed receiver keeps 148.5 of it on 9.4 cores, dropping nothing):
+
+| queues | before | after |
+| --- | --- | --- |
+| 1 | 34.0 Mpps kept, 1.5 cores | 35.5 Mpps, 1.5 cores |
+| 2 | 65.2 Mpps kept, 3.1 cores | 66.6 Mpps, 3.2 cores |
+| 4 | 125.9 Mpps kept, 6.2 cores | **129.5 Mpps**, 6.3 cores |
+| 8 | 45.6 Mpps kept, 2.2 cores | **129.6 Mpps**, 9.2 cores |
+| 16 | 66.8 Mpps kept, 3.7 cores | **132.0 Mpps**, 9.6 cores |
+| 24 | 107.9 Mpps kept, 10.6 cores | **132.0 Mpps**, 12.6 cores |
+| 48 | 129.9 Mpps kept, 10.3 cores | 130.5 Mpps, 13.8 cores |
+
+Everything offered, with **no drops at all**, from four queues up. (These arms
+also carry the flush-timeout change above, which is what the 8- and 16-queue
+rows are mostly showing; at 48 queues the old 200µs was the cheaper of the two,
+which is why it was chosen there.)
+
+**Beside, not on top — unless you only transmit.** Sharing the interrupt's core
+is the best possible arrangement for transmit, and it is what the generator
+numbers above are doing: one core carries a whole queue instead of half of one.
+But it is ruinous for receive, where the kernel half needs a whole core to
+itself at 30 Mpps and a receive loop asked to share with it gets almost nothing:
+
+| one receive queue, worker | kept | cores |
+| --- | --- | --- |
+| beside the interrupt | 30.5 Mpps | 1.50 (1.00 softirq) |
+| on the interrupt's core | 0.99 Mpps | 1.01 (0.99 softirq) |
+
+So a fleet that can receive never shares, and its preference order is: same
+complex, another physical core first, then the interrupt's SMT sibling, then
+nothing at all. A queue with nowhere to go is left to the scheduler, because
+stacking it on its own interrupt is worse than not placing it. Only a fleet that
+redirects nothing — `MatchNone()`, which cannot receive — shares.
+
+Worth knowing:
+
+- Interrupt routing is host state, like the NAPI settings: restored on `Close`,
+  but **a crash leaves it applied**. To reset by hand, restart `irqbalance`, or
+  write the driver's own hints back with `/proc/irq/<n>/smp_affinity_list`.
+- The goroutine stays locked to its OS thread. Don't drive a socket from a
+  goroutine that does anything else of substance.
+- A goroutine driving several queues pins once, for the first of them, instead
+  of being dragged between them.
+- If the kernel refuses the placement — a `taskset` or cpuset that excludes the
+  CPU — that is taken as the operator being more specific than the library, and
+  the queue is left alone.
+- Generic/SKB mode is never placed, so veth and test setups are untouched.
+- Opt out with `WithoutAffinity()`, or name the CPUs yourself with
+  `WithAffinity(4, 6, 8)` — queue *q* runs on `cpus[q % len(cpus)]` and its
+  interrupt is brought to a core beside it.
+- `Fleet.Affinity()` returns the CPU per queue (-1 for unplaced), and
+  `Fleet.Info()` summarises it.
+
+Driver interrupt names are recognised for `mlx5`, `ixgbe`, `i40e`/`ice`, `bnxt`,
+`ena`, `igb`, `mlx4` and `virtio-net`. On anything else no per-queue interrupt is
+found, nothing is placed, and `Info` says so.
+
 
 ### Queue count
 
@@ -409,9 +617,10 @@ fleet, err := afxdp.Open("eth0", afxdp.WithFilter(
 ```
 
 A runnable version is in
-[`pcapfilter/example`](pcapfilter/example). If you already have cBPF
-instructions — from `tcpdump -ddd`, `pcap_compile`, or anywhere else — skip
-libpcap and use the pure-Go `bpfmatch` module directly:
+[`pcapfilter/example`](pcapfilter/example).
+
+Underneath it, `bpfmatch` takes the compiled **classic BPF instructions**
+directly, with no libpcap and no cgo:
 
 ```
 go get github.com/atoonk/go-afxdp/bpfmatch

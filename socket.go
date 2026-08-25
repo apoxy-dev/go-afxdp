@@ -10,6 +10,7 @@ package afxdp
 import (
 	"fmt"
 	"net"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -97,6 +98,20 @@ type Socket struct {
 	// munmap them; the ring structs below alias into these mappings.
 	ringMems [][]byte
 
+	// CPU placement, set by Fleet.Open when auto-affinity is enabled (the
+	// default) and nil otherwise. The worker goroutine pins itself the first
+	// time it touches the datapath — see Pin and WithoutAffinity. pinTried
+	// makes that happen exactly once even when the receive and transmit halves
+	// are separate goroutines; pinnedCPU is read by Fleet.Affinity from another
+	// goroutine, hence atomic.
+	affinity  *affinityPlan
+	queueID   int
+	pinTried  atomic.Bool
+	pinnedCPU atomic.Int64
+	// pinErr keeps why placement failed, so "never tried" and "tried and was
+	// refused" are distinguishable in Info rather than both reading as -1.
+	pinErr atomic.Pointer[error]
+
 	fillRing       umemRing
 	rxRing         rxTxRing
 	txRing         rxTxRing
@@ -136,10 +151,10 @@ type Socket struct {
 	// "the ring/pool only had M"; ringFull counts full-ring early returns;
 	// submitted is what Transmit actually queued; inflightHW is the peak
 	// not-yet-completed depth. All written on the single transmit goroutine.
-	statSendReq   atomic.Uint64
-	statSendGot   atomic.Uint64
-	statRingFull  atomic.Uint64
-	statSubmitted atomic.Uint64
+	statSendReq    atomic.Uint64
+	statSendGot    atomic.Uint64
+	statRingFull   atomic.Uint64
+	statSubmitted  atomic.Uint64
 	statInflightHW atomic.Uint64
 
 	// Stats-side state: the kernel's ring indices are 32-bit and wrap every
@@ -226,7 +241,8 @@ func NewSocket(ifindex, queueID int, options *Options) (*Socket, error) {
 			opts.FillRingNumDescs, rxPool)
 	}
 
-	xsk := &Socket{fd: -1, ifindex: ifindex, options: opts, wakeFd: -1}
+	xsk := &Socket{fd: -1, ifindex: ifindex, options: opts, wakeFd: -1, queueID: queueID}
+	xsk.pinnedCPU.Store(-1)
 
 	var err error
 	xsk.fd, err = syscall.Socket(unix.AF_XDP, syscall.SOCK_RAW, 0)
@@ -457,6 +473,112 @@ func (xsk *Socket) frameBase(addr uint64) uint64 {
 	return addr - (addr % uint64(xsk.options.FrameSize))
 }
 
+// Pin locks the calling goroutine to its OS thread and moves that thread onto
+// the CPU handling this queue's NIC interrupt, so the kernel half of the queue
+// (hard IRQ, NAPI poll, XDP program, redirect) and the userspace half (this
+// goroutine) share a core and a cache instead of passing every packet between
+// two. It returns the CPU, or -1 if it did not pin.
+//
+// You do not normally need to call this: a socket from Fleet.Open pins its
+// worker automatically the first time that goroutine calls Poll, Receive,
+// ReceivePackets, Transmit, SendFunc or SendBatch, which is the point at which
+// the goroutine has identified itself as the worker for this queue. Call it
+// explicitly if you want the pinning to happen at a known moment, or want to
+// see the error when it cannot.
+//
+// It does nothing, without error, when affinity is off (WithoutAffinity, a
+// generic-mode Fleet, or a socket built by NewSocket rather than Open), when no
+// CPU could be worked out for this queue, or when the calling goroutine is
+// already pinned for another queue. It returns an error only when the kernel
+// refuses the placement, which normally means a taskset or cpuset excludes the
+// CPU — the operator being more specific than us, and left alone.
+//
+// The goroutine stays locked to its thread afterwards. Do not call it from a
+// goroutine that does anything else of substance.
+func (xsk *Socket) Pin() (int, error) {
+	if xsk.affinity == nil {
+		return -1, nil
+	}
+	// Same one-shot guard as autoPin, so an explicit Pin racing the datapath
+	// cannot pin two goroutines for one queue.
+	if !xsk.pinTried.CompareAndSwap(false, true) {
+		return xsk.PinnedCPU(), xsk.PinError()
+	}
+	cpu, err := xsk.affinity.pin(xsk.queueID)
+	if err != nil {
+		xsk.pinErr.Store(&err)
+		return -1, err
+	}
+	if cpu >= 0 {
+		xsk.pinnedCPU.Store(int64(cpu))
+	}
+	return cpu, err
+}
+
+// PinnedCPU reports the CPU this socket's worker was pinned to, or -1 if it is
+// not pinned. See Pin.
+func (xsk *Socket) PinnedCPU() int { return int(xsk.pinnedCPU.Load()) }
+
+// Unpin releases the calling goroutine from the CPU and the OS thread Pin gave
+// it, restoring the affinity mask it had before. Call it from the same
+// goroutine that was pinned, and only when that goroutine is going to outlive
+// its use of the socket — a worker that is about to return does not need it,
+// because a goroutine that exits while locked takes its thread with it.
+//
+// It exists so that a long-lived goroutine borrowed for a while as a queue
+// worker can be given back unchanged.
+func (xsk *Socket) Unpin() error {
+	if xsk.affinity == nil || xsk.PinnedCPU() < 0 {
+		return nil
+	}
+	var all unix.CPUSet
+	all.Zero()
+	for c := range runtime.NumCPU() {
+		all.Set(c)
+	}
+	if err := unix.SchedSetaffinity(0, &all); err != nil {
+		return fmt.Errorf("afxdp: unpin: %w", err)
+	}
+	runtime.UnlockOSThread()
+	xsk.pinnedCPU.Store(-1)
+	xsk.affinity.forget(xsk.queueID)
+	return nil
+}
+
+// autoPin pins the worker on its first trip through the datapath. It is one
+// atomic load in the steady state, and the CompareAndSwap means the receive and
+// transmit goroutines of the same socket cannot both pin it.
+//
+// It runs after the caller's closed-socket check, so draining a socket that is
+// already closed does not lock the draining goroutine to a thread for good.
+func (xsk *Socket) autoPin() {
+	if xsk.affinity == nil || xsk.pinTried.Load() {
+		return
+	}
+	if !xsk.pinTried.CompareAndSwap(false, true) {
+		return
+	}
+	cpu, err := xsk.affinity.pin(xsk.queueID)
+	if err != nil {
+		xsk.pinErr.Store(&err)
+		return
+	}
+	if cpu >= 0 {
+		xsk.pinnedCPU.Store(int64(cpu))
+	}
+}
+
+// PinError reports why this socket's worker is not pinned, or nil if it is
+// pinned or was never asked to be. It is how a queue that the kernel refused
+// (a taskset or cpuset excluding the chosen CPU) is told apart from one that
+// simply has no plan.
+func (xsk *Socket) PinError() error {
+	if e := xsk.pinErr.Load(); e != nil {
+		return *e
+	}
+	return nil
+}
+
 // ---------------- Receive side (one receive goroutine) ----------------
 
 // Fill moves up to n free receive frames onto the fill ring, where the kernel
@@ -526,10 +648,14 @@ func (xsk *Socket) NeedsWakeupTx() bool { return ringNeedsWakeup(xsk.txRing.Flag
 // Close from another goroutine wakes a blocked Poll, which then returns
 // net.ErrClosed — so a receive loop that stops on any Poll error shuts down
 // cleanly.
+//
+// The first call from a given goroutine also locks that goroutine to its OS
+// thread and moves it onto this queue's CPU; see Pin.
 func (xsk *Socket) Poll(timeout time.Duration) (numReceived int, err error) {
 	if !xsk.incref() {
 		return 0, net.ErrClosed
 	}
+	xsk.autoPin()
 	defer xsk.decref()
 	// Nothing in the fill ring means the kernel has nowhere to put a packet, so
 	// blocking would be pointless — EXCEPT when the driver is parked waiting on
@@ -565,10 +691,14 @@ func (xsk *Socket) Poll(timeout time.Duration) (numReceived int, err error) {
 // returned slice is owned by the Socket and reused on the next Receive call;
 // copy out anything you need to keep. After you are done reading the frames,
 // return them with Recycle so they can be filled again.
+//
+// The first call from a given goroutine also locks that goroutine to its OS
+// thread and moves it onto this queue's CPU; see Pin.
 func (xsk *Socket) Receive(max int) []Desc {
 	if !xsk.incref() {
 		return nil
 	}
+	xsk.autoPin()
 	defer xsk.decref()
 	avail := xsk.NumReceived()
 	if max > avail {
@@ -664,10 +794,14 @@ func (xsk *Socket) Alloc(n int) []Desc {
 // send them. It returns how many were actually queued (capped by free tx ring
 // space). Frames that are queued are owned by the kernel until they appear on
 // the completion ring; reclaim them with Complete.
+//
+// The first call from a given goroutine also locks that goroutine to its OS
+// thread and moves it onto this queue's CPU; see Pin.
 func (xsk *Socket) Transmit(descs []Desc) int {
 	if !xsk.incref() {
 		return 0
 	}
+	xsk.autoPin()
 	defer xsk.decref()
 	if free := xsk.NumFreeTxSlots(); len(descs) > free {
 		descs = descs[:free]
@@ -877,6 +1011,9 @@ func (xsk *Socket) FreeTxFrames() int { return xsk.txPool.len() }
 // A payload longer than FrameSize cannot fit in a UMEM frame; SendBatch
 // rejects the whole batch up front with an error rather than truncating it on
 // the wire, and queues nothing.
+//
+// The first call from a given goroutine also locks that goroutine to its OS
+// thread and moves it onto this queue's CPU; see Pin.
 func (xsk *Socket) SendBatch(payloads [][]byte) (int, error) {
 	if xsk.multiBuffer() {
 		// Multi-buffer socket: split oversized payloads across frames instead
@@ -904,10 +1041,14 @@ func (xsk *Socket) SendBatch(payloads [][]byte) (int, error) {
 // build must return a length in [0, len(frame)]. Anything else is reported as
 // an error and the whole batch is abandoned unqueued — the length would have
 // described bytes that were never written to the frame.
+//
+// The first call from a given goroutine also locks that goroutine to its OS
+// thread and moves it onto this queue's CPU; see Pin.
 func (xsk *Socket) SendFunc(count int, build func(i int, frame []byte) int) (int, error) {
 	if !xsk.incref() {
 		return 0, net.ErrClosed
 	}
+	xsk.autoPin()
 	defer xsk.decref()
 	xsk.statSendReq.Add(uint64(count))
 	xsk.Complete(xsk.NumCompleted()) // reclaim already-sent frames

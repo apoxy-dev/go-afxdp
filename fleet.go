@@ -40,6 +40,9 @@ type Fleet struct {
 	program *Program
 	sockets []*Socket
 	tuning  *napiTuning // NAPI settings we changed and must put back; nil if untuned
+	// affinity is the queue-to-CPU plan the workers pin themselves to, and the
+	// record of any interrupts we rerouted and must put back. nil if disabled.
+	affinity *affinityPlan
 }
 
 // openFleets pins every Fleet returned by Open until Close is called.
@@ -102,6 +105,9 @@ func CountQueues(iface string) (int, error) {
 // count — size NumFrames (WithNumFrames) accordingly on many-queue NICs.
 func Open(iface string, opts ...Option) (*Fleet, error) {
 	cfg := newConfig(opts...)
+	if cfg.affinityErr != nil {
+		return nil, cfg.affinityErr
+	}
 	base := cfg.opts.withDefaults()
 
 	// AWS ENA's zero-copy datapath requires page-sized (4096-byte) UMEM frames;
@@ -191,11 +197,22 @@ func Open(iface string, opts ...Option) (*Fleet, error) {
 				lastErr = fmt.Errorf("%s bind: %w", g.label, err)
 				continue
 			}
+			// Work out which core each queue's worker belongs on, and steer
+			// the interrupts that are not already there. Native mode only: it
+			// is where it was measured to matter, and it keeps generic-mode
+			// setups (veth, the test suite) from mutating host state.
+			// Best-effort by design — see buildAffinityPlan.
+			var affinity *affinityPlan
+			if !cfg.noAffinity && g.xdpFlags == unix.XDP_FLAGS_DRV_MODE {
+				affinity = buildAffinityPlan(iface, nQueues, cfg.affinityCPUs, transmitOnly(cfg.matches))
+				for q, xsk := range socks {
+					xsk.affinity, xsk.queueID = affinity, q
+				}
+			}
+
 			// Defer NAPI so the kernel batches packets instead of waking us
-			// per handful. Only in native mode: that is where it was measured
-			// to matter, and it keeps generic-mode setups (veth, the test
-			// suite) from mutating host state. Best-effort by design — see
-			// applyNAPITuning.
+			// per handful. Only in native mode, for the same reasons as the
+			// placement above. Best-effort by design — see applyNAPITuning.
 			var tuning *napiTuning
 			if !cfg.noAutoTune && g.xdpFlags == unix.XDP_FLAGS_DRV_MODE {
 				deferIRQs, flush := defaultNAPIDeferHardIRQs, defaultGROFlushTimeout
@@ -205,7 +222,7 @@ func Open(iface string, opts ...Option) (*Fleet, error) {
 				tuning = applyNAPITuning(iface, deferIRQs, flush)
 			}
 			f := &Fleet{iface: iface, ifindex: ifindex, opts: opts, filter: filter,
-				program: prog, sockets: socks, tuning: tuning}
+				program: prog, sockets: socks, tuning: tuning, affinity: affinity}
 			openFleetsMu.Lock()
 			openFleets[f] = struct{}{}
 			openFleetsMu.Unlock()
@@ -215,6 +232,21 @@ func Open(iface string, opts ...Option) (*Fleet, error) {
 		prog.Close()
 	}
 	return nil, fmt.Errorf("afxdp: could not open %s (%d queues): %w", iface, nQueues, lastErr)
+}
+
+// transmitOnly reports whether a filter can never redirect a packet, i.e. the
+// fleet is a generator (WithFilter(MatchNone())) and its sockets will only ever
+// transmit. It changes where the workers are placed — see buildAffinityPlan —
+// so it has to be certain: no matches at all means "redirect everything", which
+// is the opposite.
+//
+// It shares anyRedirect with the program builder deliberately. The same
+// predicate decides whether the eBPF program has a redirect path at all and
+// whether workers may share their interrupt's core, and if those two ever
+// disagreed a fleet that can receive would be stacked on its own interrupts —
+// 30.5 Mpps becoming 0.99.
+func transmitOnly(matches []Match) bool {
+	return len(matches) > 0 && !anyRedirect(matches)
 }
 
 // modeGroup is one attach mode and the bind variants to try under it.
@@ -371,6 +403,18 @@ func (f *Fleet) WaitLinkUp(timeout time.Duration) bool {
 	return false
 }
 
+// Affinity reports the CPU each queue's worker is pinned to, indexed by queue
+// ID, with -1 for queues that are not pinned (affinity disabled, no CPU
+// available, or the worker goroutine has not touched the datapath yet). See
+// WithoutAffinity.
+func (f *Fleet) Affinity() []int {
+	cpus := make([]int, len(f.sockets))
+	for q := range cpus {
+		cpus[q] = f.sockets[q].PinnedCPU()
+	}
+	return cpus
+}
+
 // Sockets returns the per-queue sockets, indexed by queue ID.
 func (f *Fleet) Sockets() []*Socket { return f.sockets }
 
@@ -421,5 +465,9 @@ func (f *Fleet) Close() error {
 	// us, so leaving them changed after we are gone would be rude.
 	f.tuning.restore()
 	f.tuning = nil
+	// Put back any interrupt we rerouted, for the same reason: the routing
+	// belongs to the host, not to us.
+	f.affinity.release()
+	f.affinity = nil
 	return firstErr
 }

@@ -20,7 +20,7 @@ import (
 // 118.8 Mpps across 48 queues:
 //
 //	kernel default (0/0)          18 packets per wakeup, 5.7M wakeups/s, 36.5 of 48 cores
-//	defer 2, flush 200us          74 packets per wakeup, 1.6M wakeups/s, 14.0 of 48 cores
+//	defer 2, flush 20us           53 packets per wakeup, 2.5M wakeups/s, 14.1 of 48 cores
 //
 // Same throughput for well under half the machine. The reason is that the
 // kernel wakes an AF_XDP receiver once per NAPI poll, and left to itself it
@@ -29,12 +29,29 @@ import (
 // syscall entry, poll bookkeeping — is paid for a handful of packets instead of
 // dozens. Deferring lets packets accumulate so each wakeup is worth making.
 //
-// Do not raise these much further. At defer 10 / flush 500us the same sink fell
-// to 77 Mpps with 29M discards a second, because NAPI no longer ran often
-// enough to keep the rings drained.
+// The flush timeout is 20µs and not more, because it is really a ceiling on how
+// fast one queue can be drained: a queue delivers about a thousand packets per
+// flush interval and no more, whatever is offered. That ceiling is invisible
+// when the load is spread thin — which is how this was originally tuned, at 48
+// queues taking 2.7 Mpps each — and brutal when it is not. Offering 132 Mpps of
+// 64-byte frames to the same NIC, packets kept and whole-machine cores:
+//
+//	flush    8 queues      16 queues     24 queues     48 queues
+//	none     132.2  9.9c   132.1  9.0c   131.2 15.6c   114.7 29.4c
+//	20us     132.2  9.2c   132.2  9.7c   132.1 12.6c   130.6 14.1c
+//	50us     123.7  7.2c   132.2  9.2c   132.0 11.4c   130.4 11.6c
+//	100us     78.4  4.0c   122.3  7.3c   132.0 10.6c   130.3 10.2c
+//	200us     43.1  1.9c    68.9  3.9c   103.4  8.4c   130.2  9.7c
+//
+// Every step down the table buys CPU by lowering that ceiling, and 200µs — the
+// value this library shipped until it was measured below 48 queues — puts it at
+// about 5 Mpps per queue, a third of what a single queue can actually deliver.
+// 20µs puts it near 50 Mpps per queue, comfortably above any queue's real
+// ceiling, so it costs nothing anywhere and still halves the machine at 48
+// queues. Raise it with WithNAPITuning only if you know your per-queue rate.
 const (
 	defaultNAPIDeferHardIRQs = 2
-	defaultGROFlushTimeout   = 200 * time.Microsecond
+	defaultGROFlushTimeout   = 20 * time.Microsecond
 )
 
 // napiTuning remembers an interface's original NAPI settings so Close can put

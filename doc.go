@@ -132,10 +132,25 @@ SSH packets were passed through.
 
 Open also defers NAPI on a native-mode NIC (napi_defer_hard_irqs and
 gro_flush_timeout) so the kernel batches packets instead of waking the receiver
-millions of times a second — on a 100G NIC that is about a third less receive CPU
-for the same 118 Mpps. Your previous values are restored on Close and reported by
+millions of times a second — on a 100G NIC taking 130 Mpps across 48 queues that
+is half the machine. The flush timeout is deliberately short (20µs): it doubles
+as a ceiling on how fast one queue can be drained, so a longer one is free with
+many thin queues and a cliff with a few busy ones. Your previous values are restored on Close and reported by
 Fleet.Info; use WithoutAutoTune to manage them yourself, or WithNAPITuning to
 change them. Generic/SKB mode is never touched.
+
+Open also places your workers. Each queue is really two halves — the interrupt,
+NAPI poll and XDP redirect in the kernel, and your goroutine in userspace — and
+left alone they land on unrelated cores, so every packet crosses a cache
+boundary. Open works out which CPU each queue's interrupt is on and locks the
+goroutine driving that queue beside it, the first time it calls any of Poll,
+Receive, ReceivePackets, Transmit, SendFunc or SendBatch; interrupts with no
+free core next to them are moved and
+restored on Close. A transmit-only fleet (WithFilter(MatchNone())) shares the
+interrupt's core instead, since nothing is competing for it. On a 100G NIC that
+is 2x the packets for half the CPU, and 64-byte line rate from eight physical
+cores. Use WithoutAffinity to place threads yourself, WithAffinity to name the
+CPUs, or Socket.Pin to do it at a moment of your choosing.
 
 Open auto-selects the XDP mode: it tries native zero-copy, then native copy,
 then generic copy, using the first the driver accepts, so you get the fast path
