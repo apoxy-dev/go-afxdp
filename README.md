@@ -312,6 +312,35 @@ at any queue count while still halving the machine at 48. Versions of this
 library before this measurement defaulted to 200µs, which was tuned at 48 queues
 and silently capped everything below that.
 
+### Transmit packing
+
+mlx5 packs several packets into one work queue entry and, under load, copies
+each into it rather than pointing at it. Copying means the card fetches one
+thing per packet instead of two, which is the only way past its roughly 75
+million packets a second ceiling for separately fetched packets. But an inlined
+64-byte packet takes five of the entry's sixteen-byte segments where a pointer
+takes one, so five times fewer packets share an entry and each queue runs at
+about half speed. Measured on a ConnectX-6 Dx at 64 bytes, Mpps:
+
+| queues | packing off | packing on |
+| ---: | ---: | ---: |
+| 1 | **17.6** | 8.5 |
+| 4 | **69.8** | 46.0 |
+| 6 | **75.3** | 69.2 |
+| 8 | 75.4 | **92.5** |
+| 16 | 74.2 | **140.8** |
+
+Off is twice as fast per queue and stops dead at the port's ceiling; on is half
+as fast per queue and has no ceiling. Neither is right on its own, and the
+library does not choose for you: the ceiling turned out to be a property of the
+adapter rather than of the link, so a rule measured on one card would be a guess
+on another. If you drive **six queues or fewer** on an mlx5 NIC and want small
+frames, it is worth trying:
+
+    ethtool --set-priv-flags <iface> xdp_tx_mpwqe off
+
+and putting it back afterwards. Above that queue count, leave it on.
+
 Worth knowing, since these are properties of the interface rather than of your
 process:
 
