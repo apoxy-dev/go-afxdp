@@ -228,39 +228,48 @@ above: the card DMAs straight into a buffer the driver posted in advance, so
 nothing is copied per frame and the frame size costs nothing.
 
 Copying is not simply the wrong choice, though — it is what makes 64-byte line
-rate possible at all. Pointer descriptors cap the *whole card* near 74 Mpps no
-matter how many queues you give them, where copying reaches 148. It is only the
-middle sizes where the trade goes the wrong way, and where that threshold sits is
-the kernel driver's decision, not something an AF_XDP application can reach.
+rate possible at all. Pointer descriptors cap the *whole card* near 75 Mpps no
+matter how many queues you give them, where copying reaches 148. It is only
+small fleets and the middle sizes where the trade goes the wrong way — and the
+switch turns out to be reachable after all: the driver exposes it as the
+`xdp_tx_mpwqe` private flag, and since v0.11.0 `Open` sets it the way the
+queue count wants. Four transmit queues or fewer run with pointer descriptors
+(17.5 Mpps per core against the copied path's 8.5–14.3, measured at 64- and
+68-byte wire frames) and the original state comes back on Close; five or more
+keep the kernel default, the only way past the ~75 Mpps wall.
+`WithoutMPWQETune` declines, and `Fleet.Info` reports what was chosen. No
+ethtool binary is involved — the flag is driven through the ethtool ioctl
+directly.
 
-Do not compare these to the per-queue table below, which counts userspace CPU
-only and predates the CPU placement.
+The per-queue table below was taken under different NIC channel counts, so
+compare its rows to each other rather than to the single-queue sweeps here.
 
 ### Scaling per queue
 
 One socket and one goroutine per queue, so queue count is roughly core count.
 Setting the NIC to N queues on both ends with `ethtool -L eno2 combined N`
 (reset the RSS table first with `ethtool -X eno2 equal N`, or the change is
-refused), 64-byte frames:
+refused), 64-byte frames. Cores are **every busy tick on the machine**, with
+the softirq share — the kernel's half of AF_XDP — shown beside it, because a
+receive path that does half its work in NAPI is not honestly measured any
+other way. Medians of three passes with all of today's defaults (placement,
+NAPI batching, the descriptor-format choice above):
 
-| queues | sent | TX cores | received | RX cores | pkt/poll |
-| --- | --- | --- | --- | --- | --- |
-| 1 | 13.6 Mpps | 1.0 | 7.7 Mpps | 0.5 | 64 |
-| 2 | 26.2 Mpps | 2.0 | 15.3 Mpps | 0.7 | 64 |
-| 4 | 51.5 Mpps | 4.0 | 34.0 Mpps | 1.6 | 64 |
-| 8 | 95.2 Mpps | 8.0 | 73.6 Mpps | 2.3 | 64 |
-| 16 | 141.3 Mpps | 16.0 | 116.9 Mpps | 4.0 | 64 |
-| 32 | 139.5 Mpps | 22.4 | 118.4 Mpps | 5.0 | 78 |
-| 48 | 138.9 Mpps | 22.7 | 118.8 Mpps | 5.7 | 92 |
+| queues | sent | TX cores (softirq) | received of 148.8 offered | RX cores (softirq) |
+| --- | --- | --- | --- | --- |
+| 1 | 18.8 Mpps | 1.0 (0.5) | 32.3 Mpps | 1.6 (1.0) |
+| 2 | 35.9 Mpps | 2.0 (1.0) | 65.1 Mpps | 3.2 (2.0) |
+| 4 | 71.1 Mpps | 4.0 (2.1) | 128.3 Mpps | 6.5 (4.0) |
+| 8 | 120.3 Mpps | 8.0 (5.5) | **148.8 Mpps** | 11.7 (7.7) |
+| 16 | **147.3 Mpps** | 16.0 (9.6) | 140.4 Mpps | 11.6 (7.2) |
 
-Transmit scales linearly at about **13.6 Mpps per core** and reaches line rate at
-16 queues. Receive costs far less userspace CPU because the expensive half — the
-driver's NAPI poll and the XDP redirect — runs in softirq, not in the process;
-a single queue tops out near 7.7 Mpps while our loop consumes it with half a core.
-
-These numbers predate the automatic CPU placement described below, and were
-taken with the workers left to the scheduler; see
-[CPU affinity](#cpu-affinity-done-for-you) for the same box measured both ways.
+Transmit runs pointer descriptors to four queues (~17.9 Mpps per core), takes
+the copied path from six, and reaches line rate at sixteen. Receive takes the
+whole wire on eight queues and costs about 1.5 cores per queue — a worker and
+most of a soft interrupt; past its line-rate point more queues only spend
+more machine (the 16-queue receive row is the same NIC limit costing more).
+A transmit worker is busy-polling, so its user half reads as occupancy; the
+receive rows block in poll and their cores are real work.
 
 **More queues is not better.** Past 16 nothing gets faster — transmit is at line
 rate and receive is at the NIC's limit — but the receiver keeps costing more CPU.
