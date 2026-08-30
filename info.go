@@ -57,7 +57,7 @@ func (f *Fleet) Info() (Info, error) {
 		FrameSize: f.opts.FrameSize,
 		NumFrames: f.opts.NumFrames,
 		Filter:    f.filter,
-		Tuning:    f.tuning.String(),
+		Tuning:    tuningDesc(f),
 		Affinity:  f.affinity.String(),
 		XDPMode:   "unknown",
 	}
@@ -101,6 +101,17 @@ func (i Info) String() string {
 		s += ", affinity " + i.Affinity
 	}
 	return s
+}
+
+// tuningDesc joins everything the fleet changed on the host into the one
+// Tuning string applications already log, so the mpwqe choice is as visible
+// as the NAPI one.
+func tuningDesc(f *Fleet) string {
+	d := f.tuning.String()
+	if m := f.mpwqe.String(); m != "" {
+		d += ", " + m
+	}
+	return d
 }
 
 // interfaceDriver returns the kernel driver bound to an interface (from

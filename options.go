@@ -171,6 +171,7 @@ type config struct {
 	// NAPI auto-tuning (see WithoutAutoTune). noAutoTune disables it; the two
 	// values are zero unless WithNAPITuning overrode them.
 	noAutoTune    bool
+	noMPWQETune   bool // leave xdp_tx_mpwqe alone (see WithoutMPWQETune)
 	napiDeferIRQs int
 	napiFlush     time.Duration
 
@@ -437,6 +438,15 @@ func WithKeepManagement(extraTCPPorts ...uint16) Option {
 // up to the flush timeout when traffic is sparse). Generic/SKB mode is never
 // tuned, so veth and test setups are untouched either way.
 func WithoutAutoTune() Option { return func(c *config) { c.noAutoTune = true } }
+
+// WithoutMPWQETune leaves the mlx5 driver's xdp_tx_mpwqe private flag exactly
+// as it is. By default a fleet of four queues or fewer turns it off while it
+// runs — pointer descriptors move ~17.5 Mpps per core against the copied
+// path's 8.5-14.3 — and restores it on Close; five queues or more leave the
+// kernel default alone, because only the copied path scales past the card's
+// ~75 Mpps pointer wall. See the measurement in mpwqe.go. WithoutAutoTune
+// disables this along with the NAPI tuning.
+func WithoutMPWQETune() Option { return func(c *config) { c.noMPWQETune = true } }
 
 // WithNAPITuning overrides the auto-tuning values. deferIRQs sets
 // napi_defer_hard_irqs and flush sets gro_flush_timeout; the defaults are 2 and

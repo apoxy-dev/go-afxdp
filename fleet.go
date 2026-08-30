@@ -39,7 +39,8 @@ type Fleet struct {
 	filter  string // human-readable summary of the applied XDP filter
 	program *Program
 	sockets []*Socket
-	tuning  *napiTuning // NAPI settings we changed and must put back; nil if untuned
+	tuning  *napiTuning  // NAPI settings we changed and must put back; nil if untuned
+	mpwqe   *mpwqeTuning // xdp_tx_mpwqe state we changed and must put back; nil if untouched
 	// affinity is the queue-to-CPU plan the workers pin themselves to, and the
 	// record of any interrupts we rerouted and must put back. nil if disabled.
 	affinity *affinityPlan
@@ -221,8 +222,16 @@ func Open(iface string, opts ...Option) (*Fleet, error) {
 				}
 				tuning = applyNAPITuning(iface, deferIRQs, flush)
 			}
+
+			// Pick the mlx5 XDP transmit descriptor format the queue count
+			// wants. Native mode only, best-effort, restored on Close — see
+			// applyMPWQETuning and the measurements in mpwqe.go.
+			var mpwqe *mpwqeTuning
+			if !cfg.noAutoTune && !cfg.noMPWQETune && g.xdpFlags == unix.XDP_FLAGS_DRV_MODE {
+				mpwqe = applyMPWQETuning(iface, nQueues)
+			}
 			f := &Fleet{iface: iface, ifindex: ifindex, opts: opts, filter: filter,
-				program: prog, sockets: socks, tuning: tuning, affinity: affinity}
+				program: prog, sockets: socks, tuning: tuning, mpwqe: mpwqe, affinity: affinity}
 			openFleetsMu.Lock()
 			openFleets[f] = struct{}{}
 			openFleetsMu.Unlock()
@@ -465,6 +474,8 @@ func (f *Fleet) Close() error {
 	// us, so leaving them changed after we are gone would be rude.
 	f.tuning.restore()
 	f.tuning = nil
+	f.mpwqe.restore()
+	f.mpwqe = nil
 	// Put back any interrupt we rerouted, for the same reason: the routing
 	// belongs to the host, not to us.
 	f.affinity.release()
