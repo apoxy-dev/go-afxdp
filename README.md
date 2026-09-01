@@ -1162,6 +1162,7 @@ but the old figure no longer describes it.
 | [`examples/multiqueue`](examples/multiqueue) | `Open` across all queues, `Info` plus aggregate `Stats` |
 | [`examples/udpreflector`](examples/udpreflector) | `Open` plus a UDP-port filter, wire-speed UDP echo with `Info`/`Stats` |
 | [`examples/dns`](examples/dns) | a real scenario, a UDP/53 forwarding DNS resolver: AF_XDP client path, `miekg/dns` upstream to 8.8.8.8, async worker pool |
+| [`examples/natlb`](examples/natlb) | **a NAT-mode TCP load balancer**: SNAT/PAT plus DNAT in userspace, a connection table both ways, zero-copy rewrite with `WithTxReuseRxFrames`, and a namespace demo you can run |
 | [`pcapfilter/example`](pcapfilter/example) | **filtering by tcpdump expression** — `-filter "tcp port 443 and not src net 192.0.2.0/24"` |
 | [`examples/customfilter/gre`](examples/customfilter/gre) | **the low-level story end to end**: a custom `Match` written with the exported API, `MatchError` validation, and a unit test that runs it against crafted packets with no NIC |
 | [`examples/customfilter/`](examples/customfilter) | four more custom matchers: a VLAN ID, a destination MAC, TCP SYNs, a VXLAN VNI, plus `udpsrcport` as the tutorial |
