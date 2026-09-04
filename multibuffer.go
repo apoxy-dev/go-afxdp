@@ -42,10 +42,12 @@ func (p Packet) Len() int {
 // handful of frames.
 const maxTxSegs = 18
 
-// multiBuffer reports whether this socket was bound with XDP_USE_SG. Without
-// it the kernel drops every multi-buffer packet before it reaches the rx ring,
-// so chains can only ever appear when this is true.
-func (xsk *Socket) multiBuffer() bool {
+// MultiBuffer reports whether this socket was bound with XDP_USE_SG, so a
+// received packet may span several frames, XDP_PKT_CONTD set on every
+// fragment but the last. Without it the kernel drops every multi-buffer
+// packet before it reaches the rx ring, so chains can only ever appear when
+// this is true.
+func (xsk *Socket) MultiBuffer() bool {
 	return xsk.options.BindFlags&unix.XDP_USE_SG != 0
 }
 

@@ -248,7 +248,7 @@ func TestSendBatchOversizedWithoutMultiBuffer(t *testing.T) {
 	tx, _ := openVethFleets(t, ifA, ifB, WithFrameSize(2048))
 	txSock := tx.Sockets()[0]
 
-	if txSock.multiBuffer() {
+	if txSock.MultiBuffer() {
 		t.Fatal("socket bound with XDP_USE_SG without WithMultiBuffer")
 	}
 	n, err := txSock.SendBatch([][]byte{make([]byte, 4096)})
@@ -276,7 +276,7 @@ func TestSendBatchChainTooLong(t *testing.T) {
 	tx, _ := openVethFleets(t, ifA, ifB, WithMultiBuffer(), WithFrameSize(frameSize))
 	txSock := tx.Sockets()[0]
 
-	if !txSock.multiBuffer() {
+	if !txSock.MultiBuffer() {
 		t.Fatal("WithMultiBuffer did not set XDP_USE_SG")
 	}
 

@@ -270,7 +270,7 @@ func NewSocket(ifindex, queueID int, options *Options) (*Socket, error) {
 		Addr:     uint64(uintptr(unsafe.Pointer(&xsk.umem[0]))),
 		Len:      uint64(len(xsk.umem)),
 		Size:     uint32(opts.FrameSize),
-		Headroom: 0,
+		Headroom: umemHeadroom,
 	}
 	if rc, _, errno := unix.Syscall6(unix.SYS_SETSOCKOPT, uintptr(xsk.fd),
 		unix.SOL_XDP, unix.XDP_UMEM_REG,
@@ -458,6 +458,20 @@ func (xsk *Socket) UMEM() []byte { return xsk.umem }
 // (after defaulting and driver-specific adjustment, e.g. 4096 on ENA) —
 // the stride for interpreting UMEM() frame-by-frame.
 func (xsk *Socket) FrameSize() int { return xsk.options.FrameSize }
+
+// The UMEM is registered with this much headroom before each frame's packet
+// data, on top of the XDP_PACKET_HEADROOM the kernel always reserves.
+const (
+	umemHeadroom      = 0
+	xdpPacketHeadroom = 256 // XDP_PACKET_HEADROOM
+)
+
+// MaxPacket is the largest packet a single frame receives: the frame size
+// less the kernel's XDP_PACKET_HEADROOM and the headroom the UMEM was
+// registered with. It is the receive limit; a packet larger than this
+// arrives only in several frames (see MultiBuffer), or not at all.
+// Transmit may use the whole frame.
+func (xsk *Socket) MaxPacket() int { return xsk.options.FrameSize - xdpPacketHeadroom - umemHeadroom }
 
 // frameBase recovers a frame's base address from any address within it.
 //
@@ -1015,7 +1029,7 @@ func (xsk *Socket) FreeTxFrames() int { return xsk.txPool.len() }
 // The first call from a given goroutine also locks that goroutine to its OS
 // thread and moves it onto this queue's CPU; see Pin.
 func (xsk *Socket) SendBatch(payloads [][]byte) (int, error) {
-	if xsk.multiBuffer() {
+	if xsk.MultiBuffer() {
 		// Multi-buffer socket: split oversized payloads across frames instead
 		// of rejecting them.
 		return xsk.sendBatchSG(payloads)
