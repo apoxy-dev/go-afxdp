@@ -1,0 +1,32 @@
+--- a/pkg/tcpip/transport/tcp/connect.go
++++ b/pkg/tcpip/transport/tcp/connect.go
+@@ -1300,9 +1300,17 @@
+ 		e.route.ConfirmReachable()
+ 	}
+ 
+-	// Send an ACK for all processed packets if needed.
++	// Send an ACK for all processed packets if needed. With DelayedACKTimeout
++	// set, and less than two MSS unacknowledged, hold it briefly instead so a
++	// reply can carry it; bulk receive keeps its ACK clock either way.
+ 	if e.rcv.RcvNxt != e.snd.MaxSentAck {
+-		e.snd.sendAck()
++		if DelayedACKTimeout > 0 && e.snd.MaxSentAck.Size(e.rcv.RcvNxt) < seqnum.Size(2*uint32(e.amss)) {
++			if !e.snd.delayedAckTimer.enabled() {
++				e.snd.delayedAckTimer.enable(DelayedACKTimeout)
++			}
++		} else {
++			e.snd.sendAck()
++		}
+ 	}
+ 
+ 	e.resetKeepaliveTimer(true /* receivedData */)
+--- a/pkg/tcpip/transport/tcp/endpoint_state.go
++++ b/pkg/tcpip/transport/tcp/endpoint_state.go
+@@ -188,6 +188,7 @@
+ 		snd.reorderTimer.init(s.Clock(), timerHandler(e, e.snd.rc.reorderTimerExpired))
+ 		snd.probeTimer.init(s.Clock(), timerHandler(e, e.snd.probeTimerExpired))
+ 		snd.corkTimer.init(s.Clock(), timerHandler(e, e.snd.corkTimerExpired))
++		snd.delayedAckTimer.init(s.Clock(), timerHandler(e, e.snd.delayedAckTimerExpired))
+ 	}
+ 	e.ops.InitHandler(e, e.stack, GetTCPSendBufferLimits, GetTCPReceiveBufferLimits)
+ 	e.segmentQueue.thaw()

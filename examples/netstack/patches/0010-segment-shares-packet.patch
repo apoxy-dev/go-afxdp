@@ -1,0 +1,34 @@
+--- a/pkg/tcpip/transport/tcp/segment.go
++++ b/pkg/tcpip/transport/tcp/segment.go
+@@ -92,6 +92,10 @@
+ 	lost bool
+ }
+ 
++// ClonePacketForSegment restores upstream's behaviour of cloning the
++// delivered packet into the segment (see newIncomingSegment).
++var ClonePacketForSegment = false
++
+ func newIncomingSegment(id stack.TransportEndpointID, clock tcpip.Clock, pkt *stack.PacketBuffer) (*segment, error) {
+ 	hdr := header.TCP(pkt.TransportHeader().Slice())
+ 	var srcAddr tcpip.Address
+@@ -130,7 +134,19 @@
+ 	s.window = seqnum.Size(hdr.WindowSize())
+ 	s.rcvdTime = clock.NowMonotonic()
+ 	s.dataMemSize = pkt.MemSize()
+-	s.pkt = pkt.Clone()
++	if ClonePacketForSegment {
++		s.pkt = pkt.Clone()
++	} else {
++		// Take a reference to the delivered packet rather than clone its
++		// view list: after GRO a packet is dozens of views, and the clone
++		// (a pool get and a reference increment per view, and the same
++		// again to release the original) was a tenth of the receive
++		// profile at 100G. The caller drops its reference when delivery
++		// returns and never touches the packet again, so sharing it is
++		// safe; what the segment does to it later (trimming as it is
++		// read) it would have done to its clone.
++		s.pkt = pkt.IncRef()
++	}
+ 	s.csumValid = csumValid
+ 
+ 	if !s.pkt.RXChecksumValidated {
