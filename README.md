@@ -71,7 +71,9 @@ kernel normally.
 
 Hand `SendBatch` (or `SendFunc`) your packets and it does the ring bookkeeping for
 you, reclaiming sent frames, kicking the kernel, never stalling on a full ring.
-Just call it in a loop.
+Just call it in a loop. A loop that sends many small packets per batch can use
+`SendFuncNoKick` and one `KickIfNeeded` at the end of the batch: one syscall
+per batch instead of one per packet.
 
 ```go
 fleet, _ := afxdp.Open("eth0", afxdp.WithFilter(afxdp.MatchNone())) // transmit only
@@ -481,6 +483,11 @@ Driver interrupt names are recognised for `mlx5`, `ixgbe`, `i40e`/`ice`, `bnxt`,
 `ena`, `igb`, `mlx4` and `virtio-net`. On anything else no per-queue interrupt is
 found, nothing is placed, and `Info` says so.
 
+
+On a machine with more than one NUMA node, `Open` also registers each queue's
+UMEM from a thread bound to that queue's worker CPU: the kernel pins UMEM pages
+on the node of the thread that registers them, and that is the memory the NIC
+writes every received frame into, so the frames live where the worker runs.
 
 ### Queue count
 
@@ -932,6 +939,71 @@ copy-mode TX deadlocks (the kernel will not drain it on its own). `SendBatch` an
 
 [`examples/blast`](examples/blast) is a line-rate generator built on `SendFunc`.
 
+### Transmit metadata: let the NIC finish checksums
+
+Linux 6.8 added a small header the kernel reads from the bytes just before a
+transmit frame, through which you ask the NIC to finish a transport checksum
+(or timestamp the frame). Turn it on with `WithTxMetadata()`: every transmit
+chunk is then laid out as 16 bytes of metadata followed by the packet, `Alloc`
+and `SendFunc` hand you the packet part (`FrameSize` minus 16 bytes), and the
+descriptor says the metadata is there. A frame that asks for nothing is sent
+exactly as before, so turning it on costs nothing until you use it.
+
+```go
+feat, _ := afxdp.QueryXSKFeatures("eth0") // does the driver honour it?
+fleet, err := afxdp.Open("eth0", afxdp.WithTxMetadata(), ...)
+
+xsk.SendFunc(n, func(i int, frame []byte) int {
+    n := buildTCPSegment(frame) // checksum field = pseudo-header sum only
+    afxdp.TxMetadata{
+        Flags:      afxdp.TxMetaChecksum,
+        CsumStart:  14 + 20, // start summing at the TCP header
+        CsumOffset: 16,      // where in it the checksum field is
+    }.Put(xsk.TxMeta(frame))
+    return n
+})
+```
+
+The contract is Linux's own `CHECKSUM_PARTIAL`: the checksum field holds the
+un-complemented pseudo-header sum, and the NIC sums from `CsumStart` and
+writes the result at `CsumStart+CsumOffset`. Ask first with `QueryXSKFeatures`
+(the netdev generic-netlink family, Linux 6.3+): a driver that does not
+implement the request transmits the frame untouched, with a wrong checksum and
+no error anywhere. On this tree's kernel ixgbe does exactly that; mlx5 honours
+it. A copy-mode socket (veth, generic XDP) computes the checksum in software,
+so a program behaves the same in tests as on a NIC that offloads.
+
+`WithTxMetadata` cannot be combined with `WithTxReuseRxFrames` (received frames
+have no room in front of them), and `SendBatch` payloads are capped at
+`FrameSize` minus the 16 bytes.
+
+### One UMEM for the whole fleet: `WithSharedMemory`
+
+By default each socket maps its own UMEM, so a frame address means something
+only to the socket it belongs to. `WithSharedMemory(extra)` maps one region
+for the fleet — every queue's frames in a row, then `extra` bytes the fleet
+never touches — and registers that same region with each socket, the way VPP
+registers its buffer pool with every AF_XDP socket it opens. Each socket still
+owns its own frames (its fill ring and transmit pool draw only from its
+slice), but an address is the same on every socket, and a frame in the extra
+area can be transmitted by any of them without a copy:
+
+```go
+fleet, _ := afxdp.Open("eth0", afxdp.WithSharedMemory(256<<20),
+    afxdp.WithOnForeignComplete(func(addr uint64) { cache.release(addr) }))
+base, mem := fleet.Extra()          // the caller's area and its address
+copy(mem[off:], packet)             // build the frame once, in place
+xsk.Transmit([]afxdp.Desc{{Addr: base + off, Len: uint32(len(packet))}})
+```
+
+A transmitted address from outside a socket's own frames is reported to
+`WithOnForeignComplete` when it completes, from inside `Complete`, instead of
+going into a pool — so keep that callback to an atomic and never call back
+into the socket from it. `Fleet.Memory()` is the whole region. The same rules
+as any frame apply to what you build there: a descriptor stays within one
+`FrameSize`-aligned chunk, and with `WithTxMetadata` on it leaves the 16-byte
+gap before its address. `examples/netstack` serves a content cache this way.
+
 ## Options and XDP mode
 
 Everything is configured with functional options on `Open`:
@@ -1163,6 +1235,7 @@ but the old figure no longer describes it.
 | [`examples/udpreflector`](examples/udpreflector) | `Open` plus a UDP-port filter, wire-speed UDP echo with `Info`/`Stats` |
 | [`examples/dns`](examples/dns) | a real scenario, a UDP/53 forwarding DNS resolver: AF_XDP client path, `miekg/dns` upstream to 8.8.8.8, async worker pool |
 | [`examples/natlb`](examples/natlb) | **a NAT-mode TCP load balancer**: SNAT/PAT plus DNAT in userspace, a connection table both ways, zero-copy rewrite with `WithTxReuseRxFrames`, and a namespace demo you can run |
+| [`examples/netstack`](examples/netstack) | **a userspace TCP server at 10G line rate**: gVisor's TCP/IP stack (netstack) fed straight from the rings through a `stack.LinkEndpoint`, with segmentation and receive offload done in the endpoint, an echo/HTTP server that terminates TCP off the kernel, a `-stack kernel` A/B, and the gVisor patches it took |
 | [`pcapfilter/example`](pcapfilter/example) | **filtering by tcpdump expression** — `-filter "tcp port 443 and not src net 192.0.2.0/24"` |
 | [`examples/customfilter/gre`](examples/customfilter/gre) | **the low-level story end to end**: a custom `Match` written with the exported API, `MatchError` validation, and a unit test that runs it against crafted packets with no NIC |
 | [`examples/customfilter/`](examples/customfilter) | four more custom matchers: a VLAN ID, a destination MAC, TCP SYNs, a VXLAN VNI, plus `udpsrcport` as the tutorial |
@@ -1176,7 +1249,7 @@ The `dns` example is its own Go module (so only it pulls in `github.com/miekg/dn
 and the core library stays dependency-minimal). Build it from its directory:
 
 ```
-cd examples/dns && go mod tidy && go build .
+cd examples/dns && go mod tidy && go build .        # also examples/netstack (its own module; pulls in gVisor)
 sudo ./dns -iface eth0 -upstream 8.8.8.8:53
 ```
 

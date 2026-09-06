@@ -84,8 +84,14 @@ type mpwqeRef struct {
 // that is the measured win, returning a handle that restores the original
 // state. Entirely best-effort: on a non-mlx5 driver, a kernel without the
 // flag, or without privileges, it returns nil and the caller carries on.
-func applyMPWQETuning(iface string, nQueues int) *mpwqeTuning {
-	if nQueues > mpwqeOffMaxQueues {
+//
+// forceOff turns the flag off whatever the queue count. Transmit metadata
+// needs it: with xdp_tx_mpwqe on, mlx5 (7.0) loses the checksum request of
+// a few packets in a thousand — the frames go out with the pseudo-header
+// partial in the checksum field and the peer drops them — while with the
+// flag off every request is honoured (measured on ConnectX-6, fw 22.40).
+func applyMPWQETuning(iface string, nQueues int, forceOff bool) *mpwqeTuning {
+	if nQueues > mpwqeOffMaxQueues && !forceOff {
 		return nil // the copy path is the right one; the kernel default stands
 	}
 	if !strings.HasPrefix(interfaceDriver(iface), "mlx5") {
@@ -118,6 +124,9 @@ func applyMPWQETuning(iface string, nQueues int) *mpwqeTuning {
 		bit:   bit,
 		was:   was,
 		desc:  fmt.Sprintf("%s=off (%d queue(s); pointer descriptors win to %d)", mpwqeFlagName, nQueues, mpwqeOffMaxQueues),
+	}
+	if forceOff {
+		t.desc = fmt.Sprintf("%s=off (transmit metadata: the packed path loses checksum requests)", mpwqeFlagName)
 	}
 	mpwqeRefs[iface] = &mpwqeRef{tuning: t, n: 1}
 	return t

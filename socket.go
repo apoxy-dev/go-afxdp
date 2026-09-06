@@ -10,6 +10,7 @@ package afxdp
 import (
 	"fmt"
 	"net"
+	"os"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -80,10 +81,11 @@ type rxTxRing struct {
 //     time. It wakes a blocked Poll (which returns net.ErrClosed) and waits
 //     for in-flight calls to finish before releasing the shared memory.
 type Socket struct {
-	fd      int
-	ifindex int
-	options Options
-	umem    []byte
+	umemShared bool // umem is Options.Memory: not ours to unmap
+	fd         int
+	ifindex    int
+	options    Options
+	umem       []byte
 
 	// Shutdown machinery. closing flips once, in Close. wakeFd is an eventfd
 	// included in Poll's fd set so Close can wake a blocked poller. ops counts
@@ -213,6 +215,14 @@ func NewSocket(ifindex, queueID int, options *Options) (*Socket, error) {
 	if opts.TxFrames <= 0 || opts.TxFrames >= opts.NumFrames {
 		return nil, fmt.Errorf("afxdp: TxFrames must be in (0, NumFrames), got %d of %d", opts.TxFrames, opts.NumFrames)
 	}
+	if opts.TxMetadataLen != 0 {
+		if opts.TxMetadataLen%8 != 0 || opts.TxMetadataLen >= 256 || opts.TxMetadataLen >= opts.FrameSize/2 {
+			return nil, fmt.Errorf("afxdp: TxMetadataLen must be a multiple of 8 below 256, got %d", opts.TxMetadataLen)
+		}
+		if opts.TxReuseRxFrames {
+			return nil, fmt.Errorf("afxdp: TxReuseRxFrames is incompatible with transmit metadata (received frames have no room in front)")
+		}
+	}
 	if opts.TxReuseRxFrames && opts.BindFlags&unix.XDP_USE_SG != 0 {
 		// Completion routing recovers a frame's pool from its address with
 		// aligned-chunk arithmetic on a single frame per packet. Multi-buffer
@@ -258,12 +268,28 @@ func NewSocket(ifindex, queueID int, options *Options) (*Socket, error) {
 		return nil, fmt.Errorf("afxdp: eventfd: %w", err)
 	}
 
-	xsk.umem, err = syscall.Mmap(-1, 0, opts.NumFrames*opts.FrameSize,
-		syscall.PROT_READ|syscall.PROT_WRITE,
-		syscall.MAP_PRIVATE|syscall.MAP_ANONYMOUS|syscall.MAP_POPULATE)
-	if err != nil {
-		xsk.Close()
-		return nil, fmt.Errorf("afxdp: mmap UMEM: %w", err)
+	if opts.Memory != nil {
+		// A caller-owned region (see Options.Memory): register all of it, use
+		// our slice of it, never unmap it.
+		if need := (opts.FrameBase + opts.NumFrames) * opts.FrameSize; opts.FrameBase < 0 || need > len(opts.Memory) {
+			xsk.Close()
+			return nil, fmt.Errorf("afxdp: Memory is %d bytes, frames %d..%d need %d",
+				len(opts.Memory), opts.FrameBase, opts.FrameBase+opts.NumFrames, need)
+		}
+		if uintptr(unsafe.Pointer(&opts.Memory[0]))%uintptr(os.Getpagesize()) != 0 {
+			xsk.Close()
+			return nil, fmt.Errorf("afxdp: Memory must be page-aligned")
+		}
+		xsk.umem = opts.Memory
+		xsk.umemShared = true
+	} else {
+		xsk.umem, err = syscall.Mmap(-1, 0, opts.NumFrames*opts.FrameSize,
+			syscall.PROT_READ|syscall.PROT_WRITE,
+			syscall.MAP_PRIVATE|syscall.MAP_ANONYMOUS|syscall.MAP_POPULATE)
+		if err != nil {
+			xsk.Close()
+			return nil, fmt.Errorf("afxdp: mmap UMEM: %w", err)
+		}
 	}
 
 	xdpUmemReg := unix.XDPUmemReg{
@@ -271,6 +297,13 @@ func NewSocket(ifindex, queueID int, options *Options) (*Socket, error) {
 		Len:      uint64(len(xsk.umem)),
 		Size:     uint32(opts.FrameSize),
 		Headroom: umemHeadroom,
+	}
+	if opts.TxMetadataLen != 0 {
+		// The software-checksum flag makes a copy-mode socket (veth, generic
+		// XDP) honour checksum requests too, so a program behaves the same
+		// there as on a NIC that offloads.
+		xdpUmemReg.Flags = unix.XDP_UMEM_TX_METADATA_LEN | xdpUmemTxSwCsum
+		xdpUmemReg.Tx_metadata_len = uint32(opts.TxMetadataLen)
 	}
 	if rc, _, errno := unix.Syscall6(unix.SYS_SETSOCKOPT, uintptr(xsk.fd),
 		unix.SOL_XDP, unix.XDP_UMEM_REG,
@@ -384,8 +417,8 @@ func NewSocket(ifindex, queueID int, options *Options) (*Socket, error) {
 	// Receive frames come first: [0, rxFrames). Transmit frames follow:
 	// [rxFrames, NumFrames).
 	rxFrames := opts.NumFrames - opts.TxFrames
-	xsk.rxPool = newFramePool(0, rxFrames, opts.FrameSize)
-	xsk.txPool = newFramePool(rxFrames, opts.TxFrames, opts.FrameSize)
+	xsk.rxPool = newFramePool(opts.FrameBase, rxFrames, opts.FrameSize)
+	xsk.txPool = newFramePool(opts.FrameBase+rxFrames, opts.TxFrames, opts.FrameSize)
 	xsk.popScratch = make([]uint64, 0, opts.FillRingNumDescs)
 
 	// Populate the fill ring BEFORE bind. Bind is what activates the driver's
@@ -674,7 +707,9 @@ func (xsk *Socket) Poll(timeout time.Duration) (numReceived int, err error) {
 	// Nothing in the fill ring means the kernel has nowhere to put a packet, so
 	// blocking would be pointless — EXCEPT when the driver is parked waiting on
 	// us, where the poll(2) below is the only thing that will restart it.
-	if xsk.numFilled == 0 && !xsk.NeedsWakeupRx() {
+	if xsk.numFilled == 0 && !xsk.NeedsWakeupRx() && xsk.options.BusyPollUsecs == 0 {
+		// (Under preferred busy polling the poll syscall is what drives the
+		// driver's NAPI loop, completions included, so it is never skipped.)
 		return 0, nil
 	}
 	ms := -1
@@ -798,8 +833,19 @@ func (xsk *Socket) Alloc(n int) []Desc {
 	}
 	xsk.txPopScratch = xsk.txPool.pop(n, xsk.txPopScratch[:0])
 	xsk.txScratch = xsk.txScratch[:0]
+	meta := uint64(xsk.options.TxMetadataLen)
 	for _, addr := range xsk.txPopScratch {
-		xsk.txScratch = append(xsk.txScratch, Desc{Addr: addr, Len: uint32(xsk.options.FrameSize)})
+		if meta == 0 {
+			xsk.txScratch = append(xsk.txScratch, Desc{Addr: addr, Len: uint32(xsk.options.FrameSize)})
+			continue
+		}
+		// The packet starts after the metadata; the descriptor says the
+		// metadata is there. A stale request from the frame's last use must
+		// not apply to this one, so the metadata word starts out cleared.
+		clear(xsk.umem[addr : addr+meta])
+		xsk.txScratch = append(xsk.txScratch, Desc{
+			Addr: addr + meta, Len: uint32(xsk.options.FrameSize) - uint32(meta), Options: unix.XDP_TX_METADATA,
+		})
 	}
 	return xsk.txScratch
 }
@@ -952,22 +998,25 @@ func (xsk *Socket) Complete(n int) int {
 	}
 	cons := ldIdx(xsk.completionRing.Consumer)
 	mask := uint32(xsk.options.CompletionRingNumDescs - 1)
-	if xsk.options.TxReuseRxFrames {
-		txStart := uint64(xsk.options.NumFrames-xsk.options.TxFrames) * uint64(xsk.options.FrameSize)
-		for i := 0; i < n; i++ {
-			addr := xsk.completionRing.Descs[cons&mask]
-			cons++
-			if base := xsk.frameBase(addr); base < txStart {
-				xsk.rxPool.push(base)
-			} else {
-				xsk.txPool.push(base)
+	fs := uint64(xsk.options.FrameSize)
+	lo := uint64(xsk.options.FrameBase) * fs // this socket's own frames: [lo, hi)
+	hi := lo + uint64(xsk.options.NumFrames)*fs
+	txStart := hi - uint64(xsk.options.TxFrames)*fs
+	for i := 0; i < n; i++ {
+		addr := xsk.completionRing.Descs[cons&mask]
+		cons++
+		base := xsk.frameBase(addr)
+		switch {
+		case base < lo || base >= hi:
+			// Not ours to pool: a frame from the shared region's extra area
+			// (see WithSharedMemory), whose owner takes it back.
+			if f := xsk.options.OnForeignComplete; f != nil {
+				f(addr)
 			}
-		}
-	} else {
-		for i := 0; i < n; i++ {
-			addr := xsk.completionRing.Descs[cons&mask]
-			cons++
-			xsk.txPool.push(xsk.frameBase(addr))
+		case xsk.options.TxReuseRxFrames && base < txStart:
+			xsk.rxPool.push(base)
+		default:
+			xsk.txPool.push(base)
 		}
 	}
 	stIdx(xsk.completionRing.Consumer, cons) // release: kernel may reuse these slots now
@@ -1004,6 +1053,9 @@ func (xsk *Socket) NumCompleted() int {
 	return int(n)
 }
 
+// QueueID is the NIC queue this socket is bound to.
+func (xsk *Socket) QueueID() int { return xsk.queueID }
+
 // NumTransmitted returns how many frames are on the tx ring not yet confirmed
 // sent (i.e. not yet on the completion ring).
 func (xsk *Socket) NumTransmitted() int { return xsk.numTransmitted }
@@ -1035,10 +1087,10 @@ func (xsk *Socket) SendBatch(payloads [][]byte) (int, error) {
 		return xsk.sendBatchSG(payloads)
 	}
 	for i, p := range payloads {
-		if len(p) > xsk.options.FrameSize {
-			return 0, fmt.Errorf("afxdp: SendBatch payload %d is %d bytes, larger than FrameSize %d "+
+		if cap := xsk.payloadCap(); len(p) > cap {
+			return 0, fmt.Errorf("afxdp: SendBatch payload %d is %d bytes, larger than a frame holds (%d) "+
 				"(pass WithMultiBuffer to split packets across frames)",
-				i, len(p), xsk.options.FrameSize)
+				i, len(p), cap)
 		}
 	}
 	return xsk.SendFunc(len(payloads), func(i int, frame []byte) int {
@@ -1059,6 +1111,38 @@ func (xsk *Socket) SendBatch(payloads [][]byte) (int, error) {
 // The first call from a given goroutine also locks that goroutine to its OS
 // thread and moves it onto this queue's CPU; see Pin.
 func (xsk *Socket) SendFunc(count int, build func(i int, frame []byte) int) (int, error) {
+	return xsk.sendFunc(count, build, true)
+}
+
+// SendFuncNoKick is SendFunc without the kick: frames are queued on the tx
+// ring but the driver is not told, except when the ring is full (where a kick
+// is what makes room). Call KickIfNeeded afterwards — once, after several
+// calls — to send everything queued. A caller that transmits many small
+// packets in a burst pays one syscall for the burst instead of one each.
+//
+// The frames sit unsent until that kick, so it must come promptly: a receive
+// loop that transmits during its batch and kicks at the end is the intended
+// shape. Same goroutine rules as SendFunc.
+func (xsk *Socket) SendFuncNoKick(count int, build func(i int, frame []byte) int) (int, error) {
+	return xsk.sendFunc(count, build, false)
+}
+
+// KickIfNeeded issues the transmit kick that SendFuncNoKick left out, if the
+// driver is asking for one (or always, without WithNeedWakeup, where it
+// cannot say). It is cheap when nothing is pending: one atomic load.
+func (xsk *Socket) KickIfNeeded() error {
+	if !xsk.incref() {
+		return net.ErrClosed
+	}
+	defer xsk.decref()
+	if xsk.kickNeeded() {
+		return xsk.Kick()
+	}
+	xsk.statKicksSuppressed.Add(1)
+	return nil
+}
+
+func (xsk *Socket) sendFunc(count int, build func(i int, frame []byte) int, kick bool) (int, error) {
 	if !xsk.incref() {
 		return 0, net.ErrClosed
 	}
@@ -1100,9 +1184,43 @@ func (xsk *Socket) SendFunc(count int, build func(i int, frame []byte) int) (int
 		}
 		descs[i].Len = uint32(n)
 	}
-	sub := xsk.Transmit(descs)
+	var sub int
+	if kick {
+		sub = xsk.Transmit(descs)
+	} else {
+		sub = xsk.transmitNoKick(descs)
+	}
 	xsk.statSubmitted.Add(uint64(sub))
 	return sub, nil
+}
+
+// TransmitNoKick is Transmit without the kick: the descriptors go on the
+// ring and the caller kicks later with KickIfNeeded, once for a whole batch.
+// Same ownership rule as Transmit.
+func (xsk *Socket) TransmitNoKick(descs []Desc) int { return xsk.transmitNoKick(descs) }
+
+// transmitNoKick is the shared body of Transmit and TransmitNoKick.
+func (xsk *Socket) transmitNoKick(descs []Desc) int {
+	if !xsk.incref() {
+		return 0
+	}
+	xsk.autoPin()
+	defer xsk.decref()
+	if free := xsk.NumFreeTxSlots(); len(descs) > free {
+		descs = descs[:free]
+	}
+	if len(descs) == 0 {
+		return 0
+	}
+	prod := ldIdx(xsk.txRing.Producer)
+	mask := uint32(xsk.options.TxRingNumDescs - 1)
+	for _, d := range descs {
+		xsk.txRing.Descs[prod&mask] = d
+		prod++
+	}
+	stIdx(xsk.txRing.Producer, prod) // release: descriptors written above are now visible
+	xsk.numTransmitted += len(descs)
+	return len(descs)
 }
 
 // Stats holds cumulative counters for a Socket. KernelStats carries the
@@ -1265,8 +1383,10 @@ func (xsk *Socket) Close() error {
 	}
 	xsk.ringMems = nil
 	if xsk.umem != nil {
-		if err := syscall.Munmap(xsk.umem); err != nil && firstErr == nil {
-			firstErr = fmt.Errorf("afxdp: munmap UMEM: %w", err)
+		if !xsk.umemShared {
+			if err := syscall.Munmap(xsk.umem); err != nil && firstErr == nil {
+				firstErr = fmt.Errorf("afxdp: munmap UMEM: %w", err)
+			}
 		}
 		xsk.umem = nil
 	}
@@ -1291,7 +1411,9 @@ func (xsk *Socket) PollWith(extra []int32, timeout time.Duration) (bool, error) 
 	// Same early-out as Poll: an empty fill ring means blocking is pointless —
 	// unless the driver is parked waiting on us, where the poll(2) below is the
 	// only thing that will restart it.
-	if xsk.numFilled == 0 && !xsk.NeedsWakeupRx() {
+	if xsk.numFilled == 0 && !xsk.NeedsWakeupRx() && xsk.options.BusyPollUsecs == 0 {
+		// (Under preferred busy polling the poll syscall is what drives the
+		// driver's NAPI loop, completions included, so it is never skipped.)
 		return true, nil
 	}
 	ms := -1

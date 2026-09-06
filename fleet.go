@@ -11,8 +11,10 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/vishvananda/netlink"
@@ -44,6 +46,10 @@ type Fleet struct {
 	// affinity is the queue-to-CPU plan the workers pin themselves to, and the
 	// record of any interrupts we rerouted and must put back. nil if disabled.
 	affinity *affinityPlan
+	// shared is the one UMEM every socket registered (WithSharedMemory), and
+	// extraAddr where the caller's area in it starts. nil/0 otherwise.
+	shared    []byte
+	extraAddr uint64
 }
 
 // openFleets pins every Fleet returned by Open until Close is called.
@@ -193,19 +199,49 @@ func Open(iface string, opts ...Option) (*Fleet, error) {
 			// kernel accepts either) and only shows up as the driver spinning.
 			opts.BindFlags = bindFlags | base.BindFlags
 			opts.XDPFlags = g.xdpFlags
-			socks, err := registerSockets(prog, ifindex, nQueues, &opts)
-			if err != nil {
-				lastErr = fmt.Errorf("%s bind: %w", g.label, err)
-				continue
-			}
 			// Work out which core each queue's worker belongs on, and steer
 			// the interrupts that are not already there. Native mode only: it
 			// is where it was measured to matter, and it keeps generic-mode
 			// setups (veth, the test suite) from mutating host state.
-			// Best-effort by design — see buildAffinityPlan.
+			// Best-effort by design — see buildAffinityPlan. It is decided
+			// before the sockets exist so that, on a machine with more than
+			// one NUMA node, each queue's UMEM can be registered from its
+			// worker's CPU: the kernel pins the UMEM pages on the node of the
+			// thread that registers them, and that is where the NIC then
+			// writes every received frame.
 			var affinity *affinityPlan
+			var umemCPUs []int
 			if !cfg.noAffinity && g.xdpFlags == unix.XDP_FLAGS_DRV_MODE {
 				affinity = buildAffinityPlan(iface, nQueues, cfg.affinityCPUs, transmitOnly(cfg.matches))
+				if multipleNUMANodes() {
+					umemCPUs = affinity.cpu
+				}
+			}
+			var shared []byte
+			var extraAddr uint64
+			if cfg.sharedMemory {
+				shared, extraAddr, err = mapSharedMemory(nQueues, &opts, cfg.sharedExtra)
+				if err != nil {
+					if affinity != nil {
+						affinity.release()
+					}
+					prog.Detach(ifindex)
+					prog.Close()
+					return nil, fmt.Errorf("afxdp: mmap shared UMEM: %w", err)
+				}
+			}
+			socks, err := registerSockets(prog, ifindex, nQueues, &opts, umemCPUs, shared)
+			if err != nil {
+				if affinity != nil {
+					affinity.release()
+				}
+				if shared != nil {
+					_ = syscall.Munmap(shared)
+				}
+				lastErr = fmt.Errorf("%s bind: %w", g.label, err)
+				continue
+			}
+			if affinity != nil {
 				for q, xsk := range socks {
 					xsk.affinity, xsk.queueID = affinity, q
 				}
@@ -228,10 +264,11 @@ func Open(iface string, opts ...Option) (*Fleet, error) {
 			// applyMPWQETuning and the measurements in mpwqe.go.
 			var mpwqe *mpwqeTuning
 			if !cfg.noAutoTune && !cfg.noMPWQETune && g.xdpFlags == unix.XDP_FLAGS_DRV_MODE {
-				mpwqe = applyMPWQETuning(iface, nQueues)
+				mpwqe = applyMPWQETuning(iface, nQueues, opts.TxMetadataLen > 0)
 			}
 			f := &Fleet{iface: iface, ifindex: ifindex, opts: opts, filter: filter,
-				program: prog, sockets: socks, tuning: tuning, mpwqe: mpwqe, affinity: affinity}
+				program: prog, sockets: socks, tuning: tuning, mpwqe: mpwqe, affinity: affinity,
+				shared: shared, extraAddr: extraAddr}
 			openFleetsMu.Lock()
 			openFleets[f] = struct{}{}
 			openFleetsMu.Unlock()
@@ -348,10 +385,27 @@ func localPrefixes(link netlink.Link) (prefixes []netip.Prefix, known bool, err 
 // registerSockets opens and registers one socket per queue against an
 // already-attached program. On any failure it closes whatever it opened (but
 // leaves the program attached, so the caller can retry with other bind flags).
-func registerSockets(prog *Program, ifindex, nQueues int, opts *Options) ([]*Socket, error) {
+//
+// cpus, when given, names the CPU to create each queue's socket from (see
+// Open: the UMEM lands on that CPU's NUMA node); -1 leaves a queue where the
+// caller runs.
+//
+// shared, when given, is the fleet's one UMEM (WithSharedMemory): socket q
+// gets the q-th run of NumFrames frames in it.
+func registerSockets(prog *Program, ifindex, nQueues int, opts *Options, cpus []int, shared []byte) ([]*Socket, error) {
 	var socks []*Socket
 	for q := 0; q < nQueues; q++ {
-		xsk, err := NewSocket(ifindex, q, opts)
+		var xsk *Socket
+		var err error
+		cpu := -1
+		if q < len(cpus) {
+			cpu = cpus[q]
+		}
+		o := *opts
+		if shared != nil {
+			o.Memory, o.FrameBase = shared, q*opts.NumFrames
+		}
+		onCPU(cpu, func() { xsk, err = NewSocket(ifindex, q, &o) })
 		if err != nil {
 			closeAll(socks)
 			return nil, fmt.Errorf("queue %d: %w", q, err)
@@ -461,6 +515,12 @@ func (f *Fleet) Close() error {
 		}
 	}
 	f.sockets = nil
+	if f.shared != nil {
+		if err := syscall.Munmap(f.shared); err != nil && firstErr == nil {
+			firstErr = fmt.Errorf("afxdp: munmap shared UMEM: %w", err)
+		}
+		f.shared = nil
+	}
 	if f.program != nil {
 		if err := f.program.Detach(f.ifindex); err != nil && firstErr == nil {
 			firstErr = err
@@ -481,4 +541,41 @@ func (f *Fleet) Close() error {
 	f.affinity.release()
 	f.affinity = nil
 	return firstErr
+}
+
+// multipleNUMANodes reports whether this machine has more than one memory
+// node, the only case where the CPU a UMEM is registered from matters.
+func multipleNUMANodes() bool {
+	b, err := os.ReadFile("/sys/devices/system/node/online")
+	if err != nil {
+		return false
+	}
+	// "0" on a single-node machine; "0-1", "0,2" and the like otherwise.
+	return strings.ContainsAny(strings.TrimSpace(string(b)), "-,")
+}
+
+// onCPU runs f with the calling thread confined to cpu, then restores the
+// thread's previous mask. A cpu below zero or a failure to move just runs f
+// where the caller is: placement is an optimisation, never a reason to fail.
+func onCPU(cpu int, f func()) {
+	if cpu < 0 {
+		f()
+		return
+	}
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	var old unix.CPUSet
+	if err := unix.SchedGetaffinity(0, &old); err != nil {
+		f()
+		return
+	}
+	var set unix.CPUSet
+	set.Zero()
+	set.Set(cpu)
+	if err := unix.SchedSetaffinity(0, &set); err != nil {
+		f()
+		return
+	}
+	f()
+	_ = unix.SchedSetaffinity(0, &old)
 }

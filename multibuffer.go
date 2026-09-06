@@ -160,7 +160,7 @@ func (xsk *Socket) sendBatchSG(payloads [][]byte) (int, error) {
 		return 0, nil
 	}
 
-	fs := xsk.options.FrameSize
+	fs := xsk.payloadCap()
 	frames := func(p []byte) int {
 		if n := (len(p) + fs - 1) / fs; n > 0 {
 			return n
@@ -219,10 +219,15 @@ func (xsk *Socket) sendBatchSG(payloads [][]byte) (int, error) {
 			n := copy(xsk.GetFrame(descs[k]), p[off:])
 			off += n
 			descs[k].Len = uint32(n)
+			// Alloc may have marked the descriptor as carrying transmit
+			// metadata; the kernel reads that from the first fragment only.
+			if j > 0 {
+				descs[k].Options &^= unix.XDP_TX_METADATA
+			}
 			if j < f-1 {
-				descs[k].Options = unix.XDP_PKT_CONTD
+				descs[k].Options |= unix.XDP_PKT_CONTD
 			} else {
-				descs[k].Options = 0
+				descs[k].Options &^= unix.XDP_PKT_CONTD
 			}
 			k++
 		}

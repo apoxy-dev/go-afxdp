@@ -79,6 +79,20 @@ type Options struct {
 	BusyPollUsecs  int
 	BusyPollBudget int
 
+	// Memory, when set, is the UMEM to register instead of mapping one: a
+	// region the caller (normally the Fleet, see WithSharedMemory) owns and
+	// unmaps. This socket's NumFrames frames start FrameBase frames into it;
+	// the rest of the region belongs to others, and a transmitted address
+	// from outside the socket's own frames is handed to OnForeignComplete
+	// when it completes rather than to a pool.
+	Memory            []byte
+	FrameBase         int
+	OnForeignComplete func(addr uint64)
+
+	// TxMetadataLen reserves this many bytes of transmit metadata in front of
+	// every transmit frame (0 = none). Set with WithTxMetadata; see txmeta.go.
+	TxMetadataLen int
+
 	// XDPFlags are passed when the BPF program is attached to the link.
 	// Useful values: unix.XDP_FLAGS_DRV_MODE (native driver XDP),
 	// unix.XDP_FLAGS_SKB_MODE (generic, works everywhere but slow),
@@ -182,6 +196,9 @@ type config struct {
 	noAffinity   bool
 	affinityCPUs []int
 	affinityErr  error
+
+	sharedMemory bool // one UMEM for all sockets (see WithSharedMemory)
+	sharedExtra  int  // caller's area after the sockets' frames, bytes
 }
 
 // xdpMode selects how Open attaches the XDP program and binds the sockets.

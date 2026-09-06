@@ -75,10 +75,17 @@ ring — so you just call it in a loop:
 	}
 
 SendFunc avoids the copy and fills each frame in place (for a generator that
-varies a field per packet). The primitives underneath — Alloc, Transmit,
-Complete, Kick, NumFreeTxSlots — are exported too if you want to hand-roll the
-loop; if you do, remember to Kick when the ring is full or copy-mode TX
-deadlocks.
+varies a field per packet). SendFuncNoKick is the same without the kick, for a
+loop that transmits many small packets per batch and calls KickIfNeeded once at
+the end. The primitives underneath — Alloc, Transmit, Complete, Kick,
+NumFreeTxSlots — are exported too if you want to hand-roll the loop; if you do,
+remember to Kick when the ring is full or copy-mode TX deadlocks.
+
+WithTxMetadata (Linux 6.8+) reserves 16 bytes in front of every transmit
+frame through which a frame asks the NIC to finish its transport checksum:
+TxMetadata{...}.Put(xsk.TxMeta(frame)) inside a SendFunc callback. Ask
+QueryXSKFeatures first — a driver that does not implement the request sends
+the frame with the checksum as written, silently.
 
 # The easy path: Open
 
