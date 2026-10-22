@@ -13,7 +13,6 @@ import (
 	"net/netip"
 	"strconv"
 	"strings"
-	"unsafe"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/asm"
@@ -844,26 +843,9 @@ func newFilterProgram(maxQueues int, exceptions, matches []Match, frags bool) (*
 		return nil, err
 	}
 
-	qidconf, err := ebpf.NewMap(&ebpf.MapSpec{
-		Name:       "qidconf_map",
-		Type:       ebpf.Array,
-		KeySize:    uint32(unsafe.Sizeof(int32(0))),
-		ValueSize:  uint32(unsafe.Sizeof(int32(0))),
-		MaxEntries: uint32(maxQueues),
-	})
+	qidconf, xsks, err := newRedirectMaps(maxQueues)
 	if err != nil {
-		return nil, fmt.Errorf("afxdp: create qidconf_map (try raising RLIMIT_MEMLOCK): %w", err)
-	}
-	xsks, err := ebpf.NewMap(&ebpf.MapSpec{
-		Name:       "xsks_map",
-		Type:       ebpf.XSKMap,
-		KeySize:    uint32(unsafe.Sizeof(int32(0))),
-		ValueSize:  uint32(unsafe.Sizeof(int32(0))),
-		MaxEntries: uint32(maxQueues),
-	})
-	if err != nil {
-		qidconf.Close()
-		return nil, fmt.Errorf("afxdp: create xsks_map (try raising RLIMIT_MEMLOCK): %w", err)
+		return nil, err
 	}
 
 	// r6 = data_end, r7 = data, r8 = rx_queue_index (callee-saved across the

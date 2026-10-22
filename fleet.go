@@ -127,7 +127,11 @@ func Open(iface string, opts ...Option) (*Fleet, error) {
 		base.FrameSize = 4096
 	}
 
-	if len(cfg.matches) == 0 {
+	if cfg.program != nil && (len(cfg.matches) > 0 || len(cfg.except) > 0 || cfg.keepManagement) {
+		return nil, fmt.Errorf("afxdp: Open(%q): WithProgram replaces the filter, so it cannot "+
+			"come with WithFilter, WithUDPPorts, WithExcept or WithKeepManagement", iface)
+	}
+	if len(cfg.matches) == 0 && cfg.program == nil {
 		return nil, fmt.Errorf("afxdp: Open(%q) needs a filter — without one every packet "+
 			"on the interface would be redirected to your sockets and kept from the kernel "+
 			"(cutting off SSH and everything else). Pass WithUDPPorts(...) or WithFilter(...) "+
@@ -168,6 +172,9 @@ func Open(iface string, opts ...Option) (*Fleet, error) {
 	exceptions = append(exceptions, cfg.except...)
 
 	filter := filterDesc(cfg.matches, exceptions)
+	if cfg.program != nil {
+		filter = "caller program"
+	}
 
 	// Even a transmit-only Fleet (MatchNone) needs its XDP program attached:
 	// in principle AF_XDP TX doesn't require one, but in practice drivers only
@@ -182,7 +189,7 @@ func Open(iface string, opts ...Option) (*Fleet, error) {
 	// bind variants (zero-copy before copy) without re-attaching.
 	var lastErr error
 	for _, g := range modeGroups(cfg.mode) {
-		prog, err := buildProgram(nQueues, exceptions, cfg.matches, cfg.multiBuffer)
+		prog, err := buildProgram(nQueues, exceptions, cfg.matches, cfg.multiBuffer, cfg.program)
 		if err != nil {
 			return nil, err // program build failure isn't mode-related
 		}
@@ -320,9 +327,12 @@ func modeGroups(m xdpMode) []modeGroup {
 	}
 }
 
-// buildProgram makes the redirect-all or filtered XDP program for nQueues.
-// frags loads it with BPF_F_XDP_HAS_FRAGS (see WithMultiBuffer).
-func buildProgram(nQueues int, exceptions, matches []Match, frags bool) (*Program, error) {
+// buildProgram makes the redirect-all, filtered or caller's XDP program for
+// nQueues. frags loads it with BPF_F_XDP_HAS_FRAGS (see WithMultiBuffer).
+func buildProgram(nQueues int, exceptions, matches []Match, frags bool, custom ProgramFunc) (*Program, error) {
+	if custom != nil {
+		return newCallerProgram(nQueues, custom)
+	}
 	if len(matches) > 0 {
 		return newFilterProgram(nQueues, exceptions, matches, frags)
 	}

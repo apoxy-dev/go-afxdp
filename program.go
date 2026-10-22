@@ -60,8 +60,11 @@ func NewMultiBufferProgram(maxQueues int) (*Program, error) {
 	return newRedirectProgram(maxQueues, true)
 }
 
-func newRedirectProgram(maxQueues int, frags bool) (*Program, error) {
-	qidconf, err := ebpf.NewMap(&ebpf.MapSpec{
+// newRedirectMaps creates the two maps every redirect program uses, with room
+// for maxQueues queues: qidconf_map (queue id -> enabled) and xsks_map (queue
+// id -> socket fd).
+func newRedirectMaps(maxQueues int) (qidconf, xsks *ebpf.Map, err error) {
+	qidconf, err = ebpf.NewMap(&ebpf.MapSpec{
 		Name:       "qidconf_map",
 		Type:       ebpf.Array,
 		KeySize:    uint32(unsafe.Sizeof(int32(0))),
@@ -69,9 +72,9 @@ func newRedirectProgram(maxQueues int, frags bool) (*Program, error) {
 		MaxEntries: uint32(maxQueues),
 	})
 	if err != nil {
-		return nil, fmt.Errorf("afxdp: create qidconf_map (try raising RLIMIT_MEMLOCK): %w", err)
+		return nil, nil, fmt.Errorf("afxdp: create qidconf_map (try raising RLIMIT_MEMLOCK): %w", err)
 	}
-	xsks, err := ebpf.NewMap(&ebpf.MapSpec{
+	xsks, err = ebpf.NewMap(&ebpf.MapSpec{
 		Name:       "xsks_map",
 		Type:       ebpf.XSKMap,
 		KeySize:    uint32(unsafe.Sizeof(int32(0))),
@@ -80,7 +83,15 @@ func newRedirectProgram(maxQueues int, frags bool) (*Program, error) {
 	})
 	if err != nil {
 		qidconf.Close()
-		return nil, fmt.Errorf("afxdp: create xsks_map (try raising RLIMIT_MEMLOCK): %w", err)
+		return nil, nil, fmt.Errorf("afxdp: create xsks_map (try raising RLIMIT_MEMLOCK): %w", err)
+	}
+	return qidconf, xsks, nil
+}
+
+func newRedirectProgram(maxQueues int, frags bool) (*Program, error) {
+	qidconf, xsks, err := newRedirectMaps(maxQueues)
+	if err != nil {
+		return nil, err
 	}
 
 	// Translation of the default xsk redirect program; see
@@ -114,6 +125,70 @@ func newRedirectProgram(maxQueues int, frags bool) (*Program, error) {
 		qidconf.Close()
 		xsks.Close()
 		return nil, fmt.Errorf("afxdp: load XDP program: %w", err)
+	}
+	return &Program{Program: prog, Queues: qidconf, Sockets: xsks}, nil
+}
+
+// ProgramFunc builds the XDP program that Open attaches in place of its own
+// (see WithProgram). sockets is the XSK map (queue id -> socket fd) and queues
+// the queue map (queue id -> 1 while a socket is registered for it).
+type ProgramFunc func(sockets, queues *ebpf.Map) (*ebpf.Program, error)
+
+// WithProgram attaches the caller's XDP program instead of the redirect or
+// filter program Open builds. Open creates the XSK map and the queue map, calls
+// build with them, and from then on treats the returned program as its own: it
+// registers each socket in the maps, attaches the program (BPF link, or the
+// netlink fallback) in the mode it picks, and closes it with the Fleet.
+//
+// The program decides what reaches the sockets. To deliver a packet it does
+// what the built-in programs do: look up ctx->rx_queue_index in queues and,
+// when the value is 1, return bpf_redirect_map(sockets, ctx->rx_queue_index, 0).
+// It can return XDP_DROP or XDP_PASS for anything else, which is the point of
+// the option: a filter Match can only redirect or pass.
+//
+//	afxdp.Open("eth0", afxdp.WithProgram(func(sockets, queues *ebpf.Map) (*ebpf.Program, error) {
+//		spec, err := loadMyXDP() // e.g. from bpf2go
+//		if err != nil {
+//			return nil, err
+//		}
+//		maps := map[string]*ebpf.Map{"xsks_map": sockets, "qidconf_map": queues}
+//		for name, m := range maps {
+//			spec.Maps[name].MaxEntries = m.MaxEntries() // the queue count of the interface
+//		}
+//		var objs myXDPObjects
+//		err = spec.LoadAndAssign(&objs, &ebpf.CollectionOptions{MapReplacements: maps})
+//		return objs.MyXdp, err
+//	}))
+//
+// build is called once for each attach mode Open tries, with new maps each
+// time, and must return a new program each call; Open closes a program whose
+// mode failed. With WithMultiBuffer, load the program with
+// BPF_F_XDP_HAS_FRAGS. The program replaces the filter, so Open returns an
+// error when WithProgram comes with WithFilter, WithUDPPorts, WithExcept or
+// WithKeepManagement.
+func WithProgram(build ProgramFunc) Option {
+	return func(c *config) { c.program = build }
+}
+
+// newCallerProgram creates the redirect maps and gives them to build for the
+// caller's program (see WithProgram).
+func newCallerProgram(maxQueues int, build ProgramFunc) (*Program, error) {
+	qidconf, xsks, err := newRedirectMaps(maxQueues)
+	if err != nil {
+		return nil, err
+	}
+	prog, err := build(xsks, qidconf)
+	if err == nil && prog == nil {
+		err = errors.New("no program")
+	}
+	if err == nil && prog.Type() != ebpf.XDP {
+		prog.Close()
+		err = fmt.Errorf("program type is %v, not XDP", prog.Type())
+	}
+	if err != nil {
+		qidconf.Close()
+		xsks.Close()
+		return nil, fmt.Errorf("afxdp: build the caller's XDP program: %w", err)
 	}
 	return &Program{Program: prog, Queues: qidconf, Sockets: xsks}, nil
 }

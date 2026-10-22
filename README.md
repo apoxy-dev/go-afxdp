@@ -609,6 +609,7 @@ The options that install them, and the two that hold traffic back, are:
 | `WithUDPPorts(ports...)` | shorthand for `WithFilter(MatchUDPPort(ports...))` |
 | `WithExcept(matches...)` | pass packets matching any of these to the kernel, whatever the filter says |
 | `WithKeepManagement(extraTCPPorts...)` | the inverse: keep ARP, IPv6 ND, SSH and DNS replies *out* of the capture so a broad filter cannot lock you out of the box ([below](#keeping-your-session-alive-withkeepmanagement)) |
+| `WithProgram(build)` | attach your own XDP program instead of a filter: `Open` gives `build` the XSK map and the queue map, and attaches and closes the program it returns as its own. It can drop, which a filter cannot |
 
 Each match is compiled to eBPF instructions with
 [`github.com/cilium/ebpf/asm`](https://pkg.go.dev/github.com/cilium/ebpf/asm) into

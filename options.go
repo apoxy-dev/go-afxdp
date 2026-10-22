@@ -199,6 +199,8 @@ type config struct {
 
 	sharedMemory bool // one UMEM for all sockets (see WithSharedMemory)
 	sharedExtra  int  // caller's area after the sockets' frames, bytes
+
+	program ProgramFunc // the caller's XDP program, in place of the filter (see WithProgram)
 }
 
 // xdpMode selects how Open attaches the XDP program and binds the sockets.
