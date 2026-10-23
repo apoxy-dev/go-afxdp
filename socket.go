@@ -146,6 +146,9 @@ type Socket struct {
 	// own goroutine, hence atomic rather than guarded by statsMu.
 	statKicks           atomic.Uint64
 	statKicksSuppressed atomic.Uint64
+	statKickEAGAIN      atomic.Uint64
+	statKickExhausted   atomic.Uint64
+	statKickEBUSY       atomic.Uint64
 
 	// Receive-path syscall accounting, same rationale as the kick counters.
 	statPolls   atomic.Uint64
@@ -915,12 +918,15 @@ func (xsk *Socket) Kick() error {
 		case unix.EINTR:
 			continue
 		case unix.EAGAIN:
+			xsk.statKickEAGAIN.Add(1)
 			if retries--; retries > 0 {
 				continue
 			}
+			xsk.statKickExhausted.Add(1)
 			return nil
 		case unix.EBUSY:
 			// Completed but not yet sent; non-fatal.
+			xsk.statKickEBUSY.Add(1)
 			return nil
 		default:
 			return fmt.Errorf("afxdp: sendto kick: %w", errno)
@@ -1213,6 +1219,13 @@ type Stats struct {
 	// you reap lazily, so prefer Transmitted for a "packets sent" count.
 	Kicks           uint64 // tx kick syscalls issued (sendto), including drain retries
 	KicksSuppressed uint64 // Transmit kicks skipped because need-wakeup showed the driver awake
+	// Kick outcomes. These count syscalls and Kick calls, not packets.
+	// KickEAGAIN counts sendto calls that returned EAGAIN (Kick tries again);
+	// KickExhausted counts Kick calls that used all their EAGAIN retries and
+	// returned with descriptors possibly still on the ring; KickEBUSY counts
+	// sendto calls that returned EBUSY (the kernel completed a frame without
+	// sending it, as when the link is down).
+	KickEAGAIN, KickExhausted, KickEBUSY uint64
 	// Polls counts rx poll(2) syscalls — one per Poll call that actually
 	// blocks. Divided by Received it gives packets per syscall, i.e. how well
 	// your receive loop is batching: a healthy loaded queue reads in the
@@ -1287,6 +1300,9 @@ func (xsk *Socket) Stats() (Stats, error) {
 	xsk.statsMu.Unlock()
 	s.Kicks = xsk.statKicks.Load()
 	s.KicksSuppressed = xsk.statKicksSuppressed.Load()
+	s.KickEAGAIN = xsk.statKickEAGAIN.Load()
+	s.KickExhausted = xsk.statKickExhausted.Load()
+	s.KickEBUSY = xsk.statKickEBUSY.Load()
 	s.Polls = xsk.statPolls.Load()
 	s.RxKicks = xsk.statRxKicks.Load()
 	s.SendReq = xsk.statSendReq.Load()

@@ -889,6 +889,103 @@ func TestTransmitKick(t *testing.T) {
 	}
 }
 
+// TestKickOutcomes checks the kick outcome counters of Stats in copy mode on
+// veth. They count sendto calls and Kick calls, not packets, so at quiescence
+// each sendto of a Kick is EAGAIN, EBUSY, or the last call that succeeded.
+func TestKickOutcomes(t *testing.T) {
+	cases := []struct {
+		name     string
+		opts     []Option
+		frames   int  // Frames on the tx ring before the one Kick.
+		peerDown bool // The peer is down, so the kernel completes each frame without sending it.
+		// check gets the counter changes of the one Kick, and the frames that
+		// are still on the tx ring after it.
+		check func(t *testing.T, d Stats, pending int)
+	}{
+		{
+			// Copy mode sends a bounded batch per sendto and returns EAGAIN while
+			// more is on the ring, so one Kick makes several sendto calls.
+			name: "Kick drains the ring", frames: 256,
+			check: func(t *testing.T, d Stats, pending int) {
+				if d.KickEAGAIN == 0 || d.KickEAGAIN != d.Kicks-1 || d.KickExhausted != 0 || d.KickEBUSY != 0 {
+					t.Errorf("Kicks %d, EAGAIN %d, exhausted %d, EBUSY %d: want EAGAIN on all but the last sendto, no exhausted kick and no EBUSY",
+						d.Kicks, d.KickEAGAIN, d.KickExhausted, d.KickEBUSY)
+				}
+			},
+		},
+		{
+			// The kernel takes no frame while the completion ring is full, and
+			// the test reclaims no completion, so each retry returns EAGAIN.
+			// Older kernels (Linux 6.12, for example) return 0 there, so the last
+			// sendto succeeds with frames still on the ring and nothing is exhausted.
+			name: "a full completion ring exhausts the retries", frames: 256,
+			opts: []Option{WithOptions(Options{CompletionRingNumDescs: 64})},
+			check: func(t *testing.T, d Stats, pending int) {
+				if d.KickExhausted == 0 && d.KickEBUSY == 0 && d.Kicks > 0 && d.KickEAGAIN == d.Kicks-1 && pending > 0 {
+					t.Skipf("this kernel returns 0, not EAGAIN, from sendto with the completion ring full (%d frames stay on the tx ring)", pending)
+				}
+				if d.Kicks == 0 || d.KickEAGAIN != d.Kicks || d.KickExhausted != 1 || d.KickEBUSY != 0 {
+					t.Errorf("Kicks %d, EAGAIN %d, exhausted %d, EBUSY %d: want EAGAIN on each sendto, one exhausted kick and no EBUSY",
+						d.Kicks, d.KickEAGAIN, d.KickExhausted, d.KickEBUSY)
+				}
+			},
+		},
+		{
+			name: "a down peer gives EBUSY", frames: 4, peerDown: true,
+			check: func(t *testing.T, d Stats, pending int) {
+				if d.Kicks != 1 || d.KickEBUSY != 1 || d.KickEAGAIN != 0 || d.KickExhausted != 0 {
+					t.Errorf("Kicks %d, EAGAIN %d, exhausted %d, EBUSY %d: want one sendto that returned EBUSY",
+						d.Kicks, d.KickEAGAIN, d.KickExhausted, d.KickEBUSY)
+				}
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ifA, ifB := newVethPair(t)
+			tx, _ := openVethFleets(t, ifA, ifB, tc.opts...)
+			xsk := tx.Sockets()[0]
+			if tc.peerDown {
+				l, err := netlink.LinkByName(ifB)
+				if err != nil {
+					t.Fatalf("look up %s: %v", ifB, err)
+				}
+				if err := netlink.LinkSetDown(l); err != nil {
+					t.Fatalf("set %s down: %v", ifB, err)
+				}
+			}
+			ring := xsk.NumFreeTxSlots()
+			descs := xsk.Alloc(tc.frames)
+			if len(descs) != tc.frames {
+				t.Fatalf("Alloc returned %d frames, want %d", len(descs), tc.frames)
+			}
+			for i := range descs {
+				descs[i].Len = uint32(copy(xsk.GetFrame(descs[i]), testFrame()))
+			}
+			if n := xsk.TransmitNoKick(descs); n != tc.frames {
+				t.Fatalf("TransmitNoKick queued %d frames, want %d", n, tc.frames)
+			}
+			before, err := xsk.Stats()
+			if err != nil {
+				t.Fatalf("Stats: %v", err)
+			}
+			if err := xsk.Kick(); err != nil {
+				t.Fatalf("Kick: %v", err)
+			}
+			after, err := xsk.Stats()
+			if err != nil {
+				t.Fatalf("Stats: %v", err)
+			}
+			tc.check(t, Stats{
+				Kicks:         after.Kicks - before.Kicks,
+				KickEAGAIN:    after.KickEAGAIN - before.KickEAGAIN,
+				KickExhausted: after.KickExhausted - before.KickExhausted,
+				KickEBUSY:     after.KickEBUSY - before.KickEBUSY,
+			}, ring-xsk.NumFreeTxSlots())
+		})
+	}
+}
+
 // transmitSustained sends numbered frames while a second goroutine calls
 // KickIfNeeded in a loop. First, before the kicker starts, it publishes frames
 // until the tx ring is full and checks that no slot is free and Alloc gives no

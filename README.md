@@ -1307,14 +1307,18 @@ does not track them, so sum frame lengths in your loop if you need them.
 
 ### Syscall counters
 
-Three counters expose what the library is doing with syscalls, which is usually
-what you want when a loop is slower than expected:
+These counters expose what the library is doing with syscalls, which is usually
+what you want when a loop is slower than expected. They count syscalls and
+calls, not packets:
 
 | field | meaning |
 | --- | --- |
 | `Polls` | blocking `poll(2)` calls on the receive side |
-| `Kicks` | `sendto(2)` kicks issued on the transmit side |
+| `Kicks` | `sendto(2)` kicks issued on the transmit side, with the retries of one `Kick` |
 | `KicksSuppressed` | transmit kicks skipped because need-wakeup showed the driver awake |
+| `KickEAGAIN` | `sendto(2)` kicks that returned `EAGAIN`, after which `Kick` tries again |
+| `KickExhausted` | `Kick` calls that used all their `EAGAIN` retries, so frames can stay on the ring |
+| `KickEBUSY` | `sendto(2)` kicks that returned `EBUSY`: the kernel completed a frame without sending it |
 
 `Stats.PacketsPerPoll()` divides `Received` by `Polls`: how many packets each
 receive syscall paid for, i.e. how well your loop batches. A `drop` sink at
