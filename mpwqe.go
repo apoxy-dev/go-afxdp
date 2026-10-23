@@ -36,8 +36,9 @@ import (
 // (16 queues, 68-byte frames) to 147.9 (64-byte). So the right setting is the
 // queue count's to make: four queues or fewer can only win with the flag off
 // (70.2 Mpps on four cores against ~58 with it on), five or more need it on
-// to pass the wall. Open applies that choice for mlx5 interfaces, saves the
-// original, and Close puts it back — the same contract as the NAPI tuning.
+// to pass the wall. Open applies that choice to zero-copy fleets on mlx5
+// interfaces (copy-mode sockets transmit through the skb path, which the flag
+// does not change), saves the original, and Close puts it back — the same contract as the NAPI tuning.
 // WithoutMPWQETune (or WithoutAutoTune) leaves the interface alone.
 const mpwqeOffMaxQueues = 4
 

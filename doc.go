@@ -165,7 +165,11 @@ Open binds copy mode: it tries native copy, then generic copy, using the first
 the driver accepts, so it works on a real NIC and on veth. It never binds
 zero-copy unless you pass WithZeroCopy, which fails if the driver cannot give
 it. Fleet.Info reports the choice. WithDriverMode and WithGenericMode force one
-attach mode. (Native XDP reinitializes the driver's rings, so attaching it
+attach mode. The mode option alone decides copy or zero-copy: Open ignores
+XDP_COPY and XDP_ZEROCOPY in the BindFlags of WithOptions. The copy default is
+Open's behavior only. The low-level NewSocket binds with Options.BindFlags as
+given, so with the default 0 the kernel picks the mode, zero-copy where the
+driver supports it. (Native XDP reinitializes the driver's rings, so attaching it
 briefly blips the link.)
 The other options (WithFrameSize, WithNumFrames, WithRingSize) tune the UMEM and
 rings.

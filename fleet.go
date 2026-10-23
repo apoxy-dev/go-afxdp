@@ -200,11 +200,12 @@ func Open(iface string, opts ...Option) (*Fleet, error) {
 		}
 		for _, bindFlags := range g.bindFlags {
 			opts := base
-			// The mode group decides zero-copy vs copy; OR rather than assign so
-			// caller flags that are orthogonal to the mode survive. Assigning here
-			// silently dropped WithNeedWakeup, which is invisible at bind time (the
-			// kernel accepts either) and only shows up as the driver spinning.
-			opts.BindFlags = bindFlags | base.BindFlags
+			// The mode group decides zero-copy vs copy, so it replaces any mode
+			// bit the caller put in BindFlags (WithOptions): the kernel refuses
+			// XDP_COPY with XDP_ZEROCOPY. The other caller flags (NEED_WAKEUP,
+			// USE_SG) stay; dropping WithNeedWakeup is invisible at bind time and
+			// only shows up as the driver spinning.
+			opts.BindFlags = bindFlags | (base.BindFlags &^ (unix.XDP_COPY | unix.XDP_ZEROCOPY))
 			opts.XDPFlags = g.xdpFlags
 			// Work out which core each queue's worker belongs on, and steer
 			// the interrupts that are not already there. Native mode only: it
@@ -267,10 +268,12 @@ func Open(iface string, opts ...Option) (*Fleet, error) {
 			}
 
 			// Pick the mlx5 XDP transmit descriptor format the queue count
-			// wants. Native mode only, best-effort, restored on Close — see
+			// wants. Zero-copy only: a copy-mode socket transmits through the
+			// skb path, which the flag does not change, so the flag stays as the
+			// host set it. Best-effort, restored on Close — see
 			// applyMPWQETuning and the measurements in mpwqe.go.
 			var mpwqe *mpwqeTuning
-			if !cfg.noAutoTune && !cfg.noMPWQETune && g.xdpFlags == unix.XDP_FLAGS_DRV_MODE {
+			if !cfg.noAutoTune && !cfg.noMPWQETune && opts.BindFlags&unix.XDP_ZEROCOPY != 0 {
 				mpwqe = applyMPWQETuning(iface, nQueues, opts.TxMetadataLen > 0)
 			}
 			f := &Fleet{iface: iface, ifindex: ifindex, opts: opts, filter: filter,

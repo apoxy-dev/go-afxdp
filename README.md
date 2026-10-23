@@ -237,7 +237,8 @@ matter how many queues you give them, where copying reaches 148. It is only
 small fleets and the middle sizes where the trade goes the wrong way — and the
 switch turns out to be reachable after all: the driver exposes it as the
 `xdp_tx_mpwqe` private flag, and since v0.11.0 `Open` sets it the way the
-queue count wants. Four transmit queues or fewer run with pointer descriptors
+queue count wants for a zero-copy fleet (a copy-mode fleet transmits through the
+skb path, which the flag does not change, so `Open` leaves it alone). Four transmit queues or fewer run with pointer descriptors
 (17.5 Mpps per core against the copied path's 8.5–14.3, measured at 64- and
 68-byte wire frames) and the original state comes back on Close; five or more
 keep the kernel default, the only way past the ~75 Mpps wall.
@@ -1032,7 +1033,13 @@ choosing. It never binds zero copy unless you pass `WithZeroCopy`, which fails i
 the driver cannot give it. `Fleet.Info()` reports what was selected.
 `WithGenericMode` forces generic copy (and never blips the link) and
 `WithDriverMode` forces native copy. These three options each pick one mode; if
-you pass more than one, the last one wins.
+you pass more than one, the last one wins. The mode option alone decides copy or
+zero copy: `Open` ignores `BindCopy` and `BindZeroCopy` in the `BindFlags` of
+`WithOptions` and keeps the other flags (`XDP_USE_NEED_WAKEUP`, `XDP_USE_SG`).
+
+The copy default is `Open` behavior. The low-level `NewSocket` binds with
+`Options.BindFlags` as given, so with the default 0 the kernel picks the mode:
+zero copy where the driver supports it, else copy.
 
 Heads up: native XDP reinitializes the driver's rings, so attaching or detaching
 it **blips the link**. On some 10G NICs (e.g. Intel ixgbe) the PHY then
@@ -1391,6 +1398,8 @@ versus passes to the kernel, without you hand-writing per-queue maps or eBPF.
 
 If you need the low-level pieces, `NewProgram`, `NewSocket`, and `Program.Attach`
 / `Register` are exported too; `Open` is just the convenient assembly of them.
+`NewSocket` does not apply the copy default: it binds with `Options.BindFlags`
+as given, so with 0 the kernel picks the mode.
 
 ## Requirements
 

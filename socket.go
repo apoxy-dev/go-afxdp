@@ -861,31 +861,11 @@ func (xsk *Socket) Alloc(n int) []Desc {
 // The first call from a given goroutine also locks that goroutine to its OS
 // thread and moves it onto this queue's CPU; see Pin.
 func (xsk *Socket) Transmit(descs []Desc) int {
-	if !xsk.incref() {
-		return 0
+	n := xsk.TransmitNoKick(descs)
+	if n > 0 {
+		_ = xsk.KickIfNeeded()
 	}
-	xsk.autoPin()
-	defer xsk.decref()
-	if free := xsk.NumFreeTxSlots(); len(descs) > free {
-		descs = descs[:free]
-	}
-	if len(descs) == 0 {
-		return 0
-	}
-	prod := ldIdx(xsk.txRing.Producer)
-	mask := uint32(xsk.options.TxRingNumDescs - 1)
-	for _, d := range descs {
-		xsk.txRing.Descs[prod&mask] = d
-		prod++
-	}
-	stIdx(xsk.txRing.Producer, prod) // release: descriptors written above are now visible
-	xsk.numTransmitted += len(descs)
-	if xsk.kickNeeded() {
-		_ = xsk.Kick()
-	} else {
-		xsk.statKicksSuppressed.Add(1)
-	}
-	return len(descs)
+	return n
 }
 
 // kickNeeded reports whether transmitting requires a kick syscall right now.
@@ -1191,7 +1171,7 @@ func (xsk *Socket) sendFunc(count int, build func(i int, frame []byte) int, kick
 	if kick {
 		sub = xsk.Transmit(descs)
 	} else {
-		sub = xsk.transmitNoKick(descs)
+		sub = xsk.TransmitNoKick(descs)
 	}
 	xsk.statSubmitted.Add(uint64(sub))
 	return sub, nil
@@ -1199,11 +1179,8 @@ func (xsk *Socket) sendFunc(count int, build func(i int, frame []byte) int, kick
 
 // TransmitNoKick is Transmit without the kick: the descriptors go on the
 // ring and the caller kicks later with KickIfNeeded, once for a whole batch.
-// Same ownership rule as Transmit.
-func (xsk *Socket) TransmitNoKick(descs []Desc) int { return xsk.transmitNoKick(descs) }
-
-// transmitNoKick is the shared body of Transmit and TransmitNoKick.
-func (xsk *Socket) transmitNoKick(descs []Desc) int {
+// Same ownership rule as Transmit, which calls it to publish.
+func (xsk *Socket) TransmitNoKick(descs []Desc) int {
 	if !xsk.incref() {
 		return 0
 	}

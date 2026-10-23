@@ -59,6 +59,8 @@ type Options struct {
 	// BindFlags are passed to bind(2) in SockaddrXDP.Flags. Useful values:
 	// unix.XDP_ZEROCOPY to demand zero-copy (bind fails if the driver can't),
 	// unix.XDP_COPY to force copy mode, 0 to let the kernel choose. Default 0.
+	// NewSocket uses them as given. Open sets the copy/zero-copy bit from its
+	// mode options and ignores XDP_COPY and XDP_ZEROCOPY here.
 	BindFlags uint16
 
 	// TxReuseRxFrames routes completions by address region (rx frames back to the
@@ -457,7 +459,8 @@ func WithKeepManagement(extraTCPPorts ...uint16) Option {
 func WithoutAutoTune() Option { return func(c *config) { c.noAutoTune = true } }
 
 // WithoutMPWQETune leaves the mlx5 driver's xdp_tx_mpwqe private flag exactly
-// as it is. By default a fleet of four queues or fewer turns it off while it
+// as it is. By default a zero-copy fleet (WithZeroCopy) of four queues or
+// fewer turns it off while it
 // runs — pointer descriptors move ~17.5 Mpps per core against the copied
 // path's 8.5-14.3 — and restores it on Close; five queues or more leave the
 // kernel default alone, because only the copied path scales past the card's

@@ -11,6 +11,8 @@ import (
 	"net/netip"
 	"os"
 	"runtime"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -789,16 +791,24 @@ func TestKickDrainsLargeBatch(t *testing.T) {
 // TestTransmitKick checks which call kicks. Transmit kicks, so its frames
 // arrive with no other call. TransmitNoKick does not: no frame arrives before
 // a KickIfNeeded, which a second goroutine calls while the transmit goroutine runs.
+// The sustained cases publish continuously into a small tx ring while a second
+// goroutine kicks; see transmitSustained.
 func TestTransmitKick(t *testing.T) {
+	// A 64-entry tx ring fills after one batch, so the sustained publisher
+	// must reclaim completions to continue.
+	smallRing := WithOptions(Options{TxRingNumDescs: 64, CompletionRingNumDescs: 64})
 	cases := []struct {
-		name   string
-		opts   []Option
-		noKick bool // Transmit with TransmitNoKick, and kick on a second goroutine.
+		name      string
+		opts      []Option
+		noKick    bool // Transmit with TransmitNoKick, and kick on a second goroutine.
+		sustained bool
 	}{
 		{name: "Transmit"},
 		{name: "Transmit need-wakeup", opts: []Option{WithNeedWakeup()}},
 		{name: "TransmitNoKick", noKick: true},
 		{name: "TransmitNoKick need-wakeup", opts: []Option{WithNeedWakeup()}, noKick: true},
+		{name: "TransmitNoKick sustained", opts: []Option{smallRing}, noKick: true, sustained: true},
+		{name: "TransmitNoKick sustained need-wakeup", opts: []Option{smallRing, WithNeedWakeup()}, noKick: true, sustained: true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -808,6 +818,10 @@ func TestTransmitKick(t *testing.T) {
 			publish := txSock.Transmit
 			if tc.noKick {
 				publish = txSock.TransmitNoKick
+			}
+			if tc.sustained {
+				transmitSustained(t, txSock, rxSock, publish)
+				return
 			}
 			frame := testFrame()
 			transmit := func(n int) {
@@ -872,6 +886,143 @@ func TestTransmitKick(t *testing.T) {
 				t.Fatalf("KickIfNeeded: %v", err)
 			}
 		})
+	}
+}
+
+// transmitSustained sends numbered frames while a second goroutine calls
+// KickIfNeeded in a loop. First, before the kicker starts, it publishes frames
+// until the tx ring is full and checks that no slot is free and Alloc gives no
+// frame. Then a publisher goroutine, which also reclaims completions, sends the
+// rest. It checks that each frame arrives exactly once and that every frame
+// comes back on the completion ring. The publisher keeps at most window frames
+// ahead of the receiver, so a slow receiver cannot overflow the rx ring.
+func transmitSustained(t *testing.T, txSock, rxSock *Socket, publish func([]Desc) int) {
+	t.Helper()
+	const total, window = 20000, 512
+	frame := testFrame()
+	// fill numbers up to n frames from seq and publishes them. It returns how
+	// many it queued.
+	fill := func(seq, n int) (int, error) {
+		descs := txSock.Alloc(n)
+		for i := range descs {
+			f := txSock.GetFrame(descs[i])
+			descs[i].Len = uint32(copy(f, frame))
+			binary.BigEndian.PutUint32(f[30:], uint32(seq+i))
+		}
+		if q := publish(descs); q != len(descs) {
+			return q, fmt.Errorf("queued %d of %d frames that fit the ring", q, len(descs))
+		}
+		return len(descs), nil
+	}
+
+	// No goroutine kicks yet, so in copy mode the kernel takes nothing.
+	ring := txSock.NumFreeTxSlots()
+	published, err := fill(0, ring)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if free := txSock.NumFreeTxSlots(); published != ring || free != 0 {
+		t.Fatalf("published %d frames into a ring of %d and %d slots are free, want a full ring", published, ring, free)
+	}
+	if d := txSock.Alloc(1); len(d) != 0 {
+		t.Fatalf("Alloc gave %d frames with the tx ring full", len(d))
+	}
+
+	var received atomic.Int64
+	var wg sync.WaitGroup
+	var kickErr, pubErr error
+	reclaimed := 0
+	stop, pubDone := make(chan struct{}), make(chan struct{})
+	stopped := false
+	halt := func() {
+		if !stopped {
+			stopped = true
+			close(stop)
+			wg.Wait()
+		}
+	}
+	// Every exit stops and joins both goroutines before the fleet cleanup
+	// closes the sockets.
+	defer halt()
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			if err := txSock.KickIfNeeded(); err != nil {
+				kickErr = err
+				return
+			}
+			runtime.Gosched()
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		defer close(pubDone)
+		deadline := time.Now().Add(30 * time.Second)
+		for reclaimed < total && time.Now().Before(deadline) {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			reclaimed += txSock.Complete(txSock.NumCompleted())
+			n := min(total-published, window-(published-int(received.Load())))
+			if n <= 0 {
+				runtime.Gosched()
+				continue
+			}
+			q, err := fill(published, n)
+			if err != nil {
+				pubErr = err
+				return
+			}
+			if q == 0 {
+				runtime.Gosched()
+			}
+			published += q
+		}
+	}()
+
+	seen := make([]bool, total)
+	got := 0
+	deadline := time.Now().Add(30 * time.Second)
+	for got < total && time.Now().Before(deadline) {
+		rxSock.Fill(rxSock.FreeRxFrames())
+		n, err := rxSock.Poll(100 * time.Millisecond)
+		if err != nil {
+			t.Fatalf("Poll: %v", err)
+		}
+		descs := rxSock.Receive(n)
+		for _, d := range descs {
+			f := rxSock.GetFrame(d)
+			if len(f) < 34 || f[12] != 0x88 || f[13] != 0xb5 {
+				continue // kernel traffic on the live link
+			}
+			seq := binary.BigEndian.Uint32(f[30:])
+			if seq >= total || seen[seq] {
+				t.Fatalf("frame %d arrived twice or was never sent", seq)
+			}
+			seen[seq] = true
+			got++
+		}
+		rxSock.Recycle(descs)
+		received.Store(int64(got))
+	}
+	<-pubDone // The publisher stops when all frames are back, or at its deadline.
+	halt()
+	if pubErr != nil {
+		t.Fatal(pubErr)
+	}
+	if kickErr != nil {
+		t.Fatalf("KickIfNeeded: %v", kickErr)
+	}
+	if got != total || published != total || reclaimed != total {
+		t.Fatalf("published %d, received %d, reclaimed %d of %d frames", published, got, reclaimed, total)
 	}
 }
 
@@ -965,32 +1116,78 @@ func TestNamespacedVeth(t *testing.T) {
 	}
 }
 
-// TestModeOptions checks the attach mode and the zero-copy state that each mode
-// option gives on veth, which has native XDP but no zero-copy.
+// newDummyLink creates an up dummy interface, which has no native XDP, and
+// removes it when the test ends. It skips the test where that is not possible.
+func newDummyLink(t *testing.T) string {
+	t.Helper()
+	if os.Geteuid() != 0 {
+		t.Skip("requires root to create a dummy device")
+	}
+	name := fmt.Sprintf("axd%06x", time.Now().UnixNano()&0xffffff)
+	link := &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: name}}
+	if err := netlink.LinkAdd(link); err != nil {
+		t.Skipf("cannot create a dummy device, so the generic fallback is not tested (no dummy module or no CAP_NET_ADMIN): %v", err)
+	}
+	t.Cleanup(func() { _ = netlink.LinkDel(link) })
+	if err := netlink.LinkSetUp(link); err != nil {
+		t.Fatalf("set %s up: %v", name, err)
+	}
+	return name
+}
+
+// TestModeOptions checks the attach mode and the zero-copy state that the mode
+// options give. veth has native XDP but no zero-copy; a dummy device has no
+// native XDP, so the default falls back to generic. The mode option alone
+// decides copy or zero-copy, whatever mode bit WithOptions carries.
 func TestModeOptions(t *testing.T) {
 	cases := []struct {
-		name     string
-		opts     []Option
-		wantErr  bool
-		wantMode string
+		name      string
+		dummy     bool // open on a dummy device instead of veth
+		opts      []Option
+		wantErrIs error // Open must fail with this errno
+		wantMode  string
 	}{
 		{name: "default", wantMode: "native"},
 		{name: "driver", opts: []Option{WithDriverMode()}, wantMode: "native"},
 		{name: "generic", opts: []Option{WithGenericMode()}, wantMode: "generic"},
-		{name: "zero-copy", opts: []Option{WithZeroCopy()}, wantErr: true},
+		// veth has no XDP socket wakeup, so a zero-copy bind is not supported.
+		{name: "zero-copy", opts: []Option{WithZeroCopy()}, wantErrIs: unix.EOPNOTSUPP},
+		{name: "default without native XDP", dummy: true, wantMode: "generic"},
+		{name: "WithOptions BindZeroCopy then default",
+			opts: []Option{WithOptions(Options{BindFlags: BindZeroCopy})}, wantMode: "native"},
+		{name: "WithOptions BindZeroCopy and need-wakeup then default",
+			opts: []Option{WithOptions(Options{BindFlags: BindZeroCopy | unix.XDP_USE_NEED_WAKEUP})}, wantMode: "native"},
+		{name: "WithOptions BindZeroCopy then generic",
+			opts: []Option{WithOptions(Options{BindFlags: BindZeroCopy}), WithGenericMode()}, wantMode: "generic"},
+		// The kernel refuses XDP_COPY with XDP_ZEROCOPY (EINVAL), so
+		// EOPNOTSUPP shows that the bind demanded zero-copy alone.
+		{name: "WithOptions BindCopy then zero-copy",
+			opts: []Option{WithOptions(Options{BindFlags: BindCopy}), WithZeroCopy()}, wantErrIs: unix.EOPNOTSUPP},
+		{name: "zero-copy then generic", opts: []Option{WithZeroCopy(), WithGenericMode()}, wantMode: "generic"},
+		{name: "generic then zero-copy", opts: []Option{WithGenericMode(), WithZeroCopy()}, wantErrIs: unix.EOPNOTSUPP},
+		{name: "generic then driver", opts: []Option{WithGenericMode(), WithDriverMode()}, wantMode: "native"},
+		{name: "driver then generic", opts: []Option{WithDriverMode(), WithGenericMode()}, wantMode: "generic"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			ifA, _ := newVethPair(t)
+			var ifA string
+			if tc.dummy {
+				ifA = newDummyLink(t)
+			} else {
+				ifA, _ = newVethPair(t)
+			}
 			if err := rlimit.RemoveMemlock(); err != nil {
 				t.Skipf("cannot raise memlock (need privileges): %v", err)
 			}
 			opts := append([]Option{WithFilter(MatchAll()), WithoutAffinity(), WithoutAutoTune()}, tc.opts...)
 			f, err := Open(ifA, opts...)
-			if tc.wantErr {
+			if tc.wantErrIs != nil {
 				if err == nil {
 					f.Close()
-					t.Fatal("Open succeeded, want an error: veth has no zero-copy")
+					t.Fatalf("Open succeeded, want %v", tc.wantErrIs)
+				}
+				if !errors.Is(err, tc.wantErrIs) {
+					t.Fatalf("Open: %v, want %v", err, tc.wantErrIs)
 				}
 				return
 			}
