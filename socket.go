@@ -498,6 +498,11 @@ func (xsk *Socket) UMEM() []byte { return xsk.umem }
 // the stride for interpreting UMEM() frame-by-frame.
 func (xsk *Socket) FrameSize() int { return xsk.options.FrameSize }
 
+// FillRingSize returns the number of descriptor slots of the fill ring. It is
+// the ring geometry, not its occupancy: NumFreeFillSlots equal to it means the
+// driver took every posted frame.
+func (xsk *Socket) FillRingSize() int { return xsk.options.FillRingNumDescs }
+
 // The UMEM is registered with this much headroom before each frame's packet
 // data, on top of the XDP_PACKET_HEADROOM the kernel always reserves.
 const (
