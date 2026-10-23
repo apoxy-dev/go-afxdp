@@ -786,23 +786,29 @@ func TestKickDrainsLargeBatch(t *testing.T) {
 	}
 }
 
-// TestWithoutTxKick sends frames on a WithoutTxKick socket. Transmit only puts
-// them on the ring, so none arrives before a kick. Then a kicker goroutine
-// kicks once for each round while the transmit goroutine runs, and each round
-// arrives before the next one starts.
-func TestWithoutTxKick(t *testing.T) {
+// TestTransmitKick checks which call kicks. Transmit kicks, so its frames
+// arrive with no other call. TransmitNoKick does not: no frame arrives before
+// a KickIfNeeded, which a second goroutine calls while the transmit goroutine runs.
+func TestTransmitKick(t *testing.T) {
 	cases := []struct {
-		name string
-		opts []Option
+		name   string
+		opts   []Option
+		noKick bool // Transmit with TransmitNoKick, and kick on a second goroutine.
 	}{
-		{name: "need-wakeup", opts: []Option{WithNeedWakeup(), WithoutTxKick()}},
-		{name: "no need-wakeup", opts: []Option{WithoutTxKick()}},
+		{name: "Transmit"},
+		{name: "Transmit need-wakeup", opts: []Option{WithNeedWakeup()}},
+		{name: "TransmitNoKick", noKick: true},
+		{name: "TransmitNoKick need-wakeup", opts: []Option{WithNeedWakeup()}, noKick: true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			ifA, ifB := newVethPair(t)
 			tx, rx := openVethFleets(t, ifA, ifB, tc.opts...)
 			txSock, rxSock := tx.Sockets()[0], rx.Sockets()[0]
+			publish := txSock.Transmit
+			if tc.noKick {
+				publish = txSock.TransmitNoKick
+			}
 			frame := testFrame()
 			transmit := func(n int) {
 				txSock.Complete(txSock.NumCompleted())
@@ -813,34 +819,42 @@ func TestWithoutTxKick(t *testing.T) {
 				for i := range descs {
 					descs[i].Len = uint32(copy(txSock.GetFrame(descs[i]), frame))
 				}
-				if got := txSock.Transmit(descs); got != n {
-					t.Fatalf("Transmit queued %d, want %d", got, n)
+				if got := publish(descs); got != n {
+					t.Fatalf("queued %d frames, want %d", got, n)
 				}
 			}
 
 			transmit(8)
-			if got := receiveCount(rxSock, 1, time.Now().Add(200*time.Millisecond)); got != 0 {
-				t.Fatalf("%d frames arrived before a kick", got)
+			want := 8
+			if tc.noKick {
+				want = 0
+			}
+			if got := receiveCount(rxSock, 8, time.Now().Add(500*time.Millisecond)); got != want {
+				t.Fatalf("%d of 8 frames arrived with no kick call, want %d", got, want)
 			}
 
 			wake, stop, kickErr := make(chan struct{}, 1), make(chan struct{}), make(chan error, 1)
-			go func() {
-				for {
-					select {
-					case <-stop:
-						kickErr <- nil
-						return
-					case <-wake:
-						if err := txSock.KickIfNeeded(); err != nil {
-							kickErr <- err
+			if tc.noKick {
+				go func() {
+					for {
+						select {
+						case <-stop:
+							kickErr <- nil
 							return
+						case <-wake:
+							if err := txSock.KickIfNeeded(); err != nil {
+								kickErr <- err
+								return
+							}
 						}
 					}
+				}()
+				wake <- struct{}{}
+				if got := receiveCount(rxSock, 8, time.Now().Add(2*time.Second)); got != 8 {
+					t.Fatalf("%d of 8 frames arrived after the kick", got)
 				}
-			}()
-			wake <- struct{}{}
-			if got := receiveCount(rxSock, 8, time.Now().Add(2*time.Second)); got != 8 {
-				t.Fatalf("%d of 8 frames arrived after the kick", got)
+			} else {
+				kickErr <- nil
 			}
 			const rounds, batch = 50, 64
 			for round := range rounds {

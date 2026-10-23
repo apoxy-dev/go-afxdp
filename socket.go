@@ -79,7 +79,7 @@ type rxTxRing struct {
 //     receive across goroutines.
 //   - Kick and KickIfNeeded use only the fd and atomic counters, so a third
 //     goroutine may call them while the transmit goroutine runs (see
-//     WithoutTxKick).
+//     TransmitNoKick).
 //   - Close is the exception: it may be called from any goroutine at any
 //     time. It wakes a blocked Poll (which returns net.ErrClosed) and waits
 //     for in-flight calls to finish before releasing the shared memory.
@@ -856,8 +856,7 @@ func (xsk *Socket) Alloc(n int) []Desc {
 // Transmit puts the given descriptors on the tx ring and kicks the kernel to
 // send them. It returns how many were actually queued (capped by free tx ring
 // space). Frames that are queued are owned by the kernel until they appear on
-// the completion ring; reclaim them with Complete. With WithoutTxKick it does
-// not kick; the caller kicks with KickIfNeeded.
+// the completion ring; reclaim them with Complete.
 //
 // The first call from a given goroutine also locks that goroutine to its OS
 // thread and moves it onto this queue's CPU; see Pin.
@@ -881,9 +880,6 @@ func (xsk *Socket) Transmit(descs []Desc) int {
 	}
 	stIdx(xsk.txRing.Producer, prod) // release: descriptors written above are now visible
 	xsk.numTransmitted += len(descs)
-	if xsk.options.NoTxKick {
-		return len(descs)
-	}
 	if xsk.kickNeeded() {
 		_ = xsk.Kick()
 	} else {
@@ -1134,10 +1130,9 @@ func (xsk *Socket) SendFuncNoKick(count int, build func(i int, frame []byte) int
 	return xsk.sendFunc(count, build, false)
 }
 
-// KickIfNeeded issues the transmit kick that SendFuncNoKick or a WithoutTxKick
-// Transmit left out, if the driver is asking for one (or always, without
-// WithNeedWakeup, where it cannot say). It is cheap when nothing is pending:
-// one atomic load.
+// KickIfNeeded issues the transmit kick that SendFuncNoKick or TransmitNoKick
+// left out, if the driver is asking for one (or always, without WithNeedWakeup,
+// where it cannot say). It is cheap when nothing is pending: one atomic load.
 func (xsk *Socket) KickIfNeeded() error {
 	if !xsk.incref() {
 		return net.ErrClosed

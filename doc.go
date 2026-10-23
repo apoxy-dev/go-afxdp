@@ -77,7 +77,7 @@ ring — so you just call it in a loop:
 SendFunc avoids the copy and fills each frame in place (for a generator that
 varies a field per packet). SendFuncNoKick is the same without the kick, for a
 loop that transmits many small packets per batch and calls KickIfNeeded once at
-the end. WithoutTxKick makes Transmit skip the kick too, so that a second
+the end. TransmitNoKick is Transmit without the kick, so that a second
 goroutine can kick with KickIfNeeded. The primitives underneath — Alloc,
 Transmit, Complete, Kick, NumFreeTxSlots — are exported too if you want to
 hand-roll the loop; if you do, remember to Kick when the ring is full or

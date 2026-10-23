@@ -93,10 +93,6 @@ type Options struct {
 	// every transmit frame (0 = none). Set with WithTxMetadata; see txmeta.go.
 	TxMetadataLen int
 
-	// NoTxKick makes Transmit put the descriptors on the tx ring without the
-	// kick. Set with WithoutTxKick.
-	NoTxKick bool
-
 	// XDPFlags are passed when the BPF program is attached to the link.
 	// Useful values: unix.XDP_FLAGS_DRV_MODE (native driver XDP),
 	// unix.XDP_FLAGS_SKB_MODE (generic, works everywhere but slow),
@@ -331,15 +327,6 @@ func WithGenericMode() Option { return func(c *config) { c.mode = modeGeneric } 
 // that drive the rings themselves rather than through Poll/Kick.
 func WithNeedWakeup() Option {
 	return func(c *config) { c.opts.BindFlags |= unix.XDP_USE_NEED_WAKEUP }
-}
-
-// WithoutTxKick makes Transmit only put the descriptors on the tx ring: it
-// does not kick. The caller kicks with KickIfNeeded, which may run on its own
-// goroutine while the transmit goroutine runs. In copy mode the kernel copies
-// each frame inside the kick, so a kick on a second core takes that work off
-// the transmit core. Until the kick, the frames stay on the ring.
-func WithoutTxKick() Option {
-	return func(c *config) { c.opts.NoTxKick = true }
 }
 
 // WithTxReuseRxFrames allows transmitting RECEIVE-pool frames in place: Complete
