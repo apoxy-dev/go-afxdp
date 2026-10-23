@@ -73,7 +73,9 @@ Hand `SendBatch` (or `SendFunc`) your packets and it does the ring bookkeeping f
 you, reclaiming sent frames, kicking the kernel, never stalling on a full ring.
 Just call it in a loop. A loop that sends many small packets per batch can use
 `SendFuncNoKick` and one `KickIfNeeded` at the end of the batch: one syscall
-per batch instead of one per packet.
+per batch instead of one per packet. With `WithoutTxKick`, `Transmit` only puts
+the frames on the ring, and a second goroutine calls `KickIfNeeded`; in copy
+mode the kernel copies the frames in that kick, on the second core.
 
 ```go
 fleet, _ := afxdp.Open("eth0", afxdp.WithFilter(afxdp.MatchNone())) // transmit only

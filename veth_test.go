@@ -786,6 +786,81 @@ func TestKickDrainsLargeBatch(t *testing.T) {
 	}
 }
 
+// TestWithoutTxKick sends frames on a WithoutTxKick socket. Transmit only puts
+// them on the ring, so none arrives before a kick. Then a kicker goroutine
+// kicks once for each round while the transmit goroutine runs, and each round
+// arrives before the next one starts.
+func TestWithoutTxKick(t *testing.T) {
+	cases := []struct {
+		name string
+		opts []Option
+	}{
+		{name: "need-wakeup", opts: []Option{WithNeedWakeup(), WithoutTxKick()}},
+		{name: "no need-wakeup", opts: []Option{WithoutTxKick()}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ifA, ifB := newVethPair(t)
+			tx, rx := openVethFleets(t, ifA, ifB, tc.opts...)
+			txSock, rxSock := tx.Sockets()[0], rx.Sockets()[0]
+			frame := testFrame()
+			transmit := func(n int) {
+				txSock.Complete(txSock.NumCompleted())
+				descs := txSock.Alloc(n)
+				if len(descs) != n {
+					t.Fatalf("Alloc returned %d frames, want %d", len(descs), n)
+				}
+				for i := range descs {
+					descs[i].Len = uint32(copy(txSock.GetFrame(descs[i]), frame))
+				}
+				if got := txSock.Transmit(descs); got != n {
+					t.Fatalf("Transmit queued %d, want %d", got, n)
+				}
+			}
+
+			transmit(8)
+			if got := receiveCount(rxSock, 1, time.Now().Add(200*time.Millisecond)); got != 0 {
+				t.Fatalf("%d frames arrived before a kick", got)
+			}
+
+			wake, stop, kickErr := make(chan struct{}, 1), make(chan struct{}), make(chan error, 1)
+			go func() {
+				for {
+					select {
+					case <-stop:
+						kickErr <- nil
+						return
+					case <-wake:
+						if err := txSock.KickIfNeeded(); err != nil {
+							kickErr <- err
+							return
+						}
+					}
+				}
+			}()
+			wake <- struct{}{}
+			if got := receiveCount(rxSock, 8, time.Now().Add(2*time.Second)); got != 8 {
+				t.Fatalf("%d of 8 frames arrived after the kick", got)
+			}
+			const rounds, batch = 50, 64
+			for round := range rounds {
+				transmit(batch)
+				select {
+				case wake <- struct{}{}:
+				default:
+				}
+				if got := receiveCount(rxSock, batch, time.Now().Add(2*time.Second)); got != batch {
+					t.Fatalf("round %d: %d of %d frames arrived", round, got, batch)
+				}
+			}
+			close(stop)
+			if err := <-kickErr; err != nil {
+				t.Fatalf("KickIfNeeded: %v", err)
+			}
+		})
+	}
+}
+
 // TestNamespacedVeth runs the low-level API (NewSocket, NewProgram) on a veth
 // pair inside a fresh network namespace, leaving the host untouched. Open
 // cannot be used here — it counts queues via /sys/class/net, which still shows
