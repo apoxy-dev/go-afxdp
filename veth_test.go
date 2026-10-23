@@ -964,3 +964,46 @@ func TestNamespacedVeth(t *testing.T) {
 		t.Fatalf("received %d of %d packets in netns", got, sent)
 	}
 }
+
+// TestModeOptions checks the attach mode and the zero-copy state that each mode
+// option gives on veth, which has native XDP but no zero-copy.
+func TestModeOptions(t *testing.T) {
+	cases := []struct {
+		name     string
+		opt      Option
+		wantErr  bool
+		wantMode string
+	}{
+		{name: "copy", opt: WithCopyMode(), wantMode: "native"},
+		{name: "driver", opt: WithDriverMode(), wantMode: "native"},
+		{name: "generic", opt: WithGenericMode(), wantMode: "generic"},
+		{name: "zero-copy", opt: WithZeroCopy(), wantErr: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ifA, _ := newVethPair(t)
+			if err := rlimit.RemoveMemlock(); err != nil {
+				t.Skipf("cannot raise memlock (need privileges): %v", err)
+			}
+			f, err := Open(ifA, tc.opt, WithFilter(MatchAll()), WithoutAffinity(), WithoutAutoTune())
+			if tc.wantErr {
+				if err == nil {
+					f.Close()
+					t.Fatal("Open succeeded, want an error: veth has no zero-copy")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Open: %v", err)
+			}
+			defer f.Close()
+			info, err := f.Info()
+			if err != nil {
+				t.Fatalf("Info: %v", err)
+			}
+			if info.XDPMode != tc.wantMode || info.ZeroCopy {
+				t.Errorf("Info = mode %q zero-copy %v, want mode %q and no zero-copy", info.XDPMode, info.ZeroCopy, tc.wantMode)
+			}
+		})
+	}
+}

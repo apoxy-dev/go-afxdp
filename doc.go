@@ -164,8 +164,9 @@ CPUs, or Socket.Pin to do it at a moment of your choosing.
 Open auto-selects the XDP mode: it tries native zero-copy, then native copy,
 then generic copy, using the first the driver accepts, so you get the fast path
 on a real NIC and it still works on veth. Fleet.Info reports the choice. Override
-it only if needed with WithDriverMode, WithGenericMode, or WithZeroCopy. (Native
-XDP reinitializes the driver's rings, so attaching it briefly blips the link.)
+it only if needed with WithDriverMode, WithGenericMode, WithZeroCopy, or
+WithCopyMode. (Native XDP reinitializes the driver's rings, so attaching it
+briefly blips the link.)
 The other options (WithFrameSize, WithNumFrames, WithRingSize) tune the UMEM and
 rings.
 

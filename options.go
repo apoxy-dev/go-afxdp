@@ -220,6 +220,9 @@ const (
 	// modeGeneric forces generic (SKB) XDP with copy semantics. Slower, but
 	// works anywhere — including veth and other virtual devices.
 	modeGeneric
+	// modeNativeCopy forces native (driver) XDP with copy semantics, also when
+	// the driver supports zero-copy.
+	modeNativeCopy
 )
 
 func newConfig(opts ...Option) config {
@@ -312,6 +315,12 @@ func WithDriverMode() Option { return func(c *config) { c.mode = modeNative } }
 // and never zero-copy, but works on any interface — including veth and other
 // virtual devices that have no native XDP — and does not blip the link.
 func WithGenericMode() Option { return func(c *config) { c.mode = modeGeneric } }
+
+// WithCopyMode forces native (driver) XDP and binds the sockets with XDP_COPY,
+// so the kernel copies each frame also when the driver supports zero-copy.
+// Open fails if the driver has no native XDP. Use it to compare copy mode with
+// zero-copy on the same NIC.
+func WithCopyMode() Option { return func(c *config) { c.mode = modeNativeCopy } }
 
 // WithNeedWakeup binds with XDP_USE_NEED_WAKEUP, letting the driver stop polling
 // when it has no receive buffers (or nothing to transmit) and wait to be woken.

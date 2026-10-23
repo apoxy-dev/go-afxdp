@@ -105,7 +105,8 @@ func CountQueues(iface string) (int, error) {
 // Open auto-selects the XDP mode: it tries native zero-copy, then native copy,
 // then generic copy, using the first the driver accepts. You don't have to
 // reason about modes; check Fleet.Info to see which was chosen. Override with
-// WithDriverMode, WithGenericMode, or WithZeroCopy only if you have a need.
+// WithDriverMode, WithGenericMode, WithZeroCopy, or WithCopyMode only if you
+// have a need.
 //
 // On any error it cleans up whatever it already created. Each socket gets its
 // own UMEM of NumFrames*FrameSize bytes, so total memory scales with the queue
@@ -322,6 +323,8 @@ func modeGroups(m xdpMode) []modeGroup {
 		return []modeGroup{native(unix.XDP_ZEROCOPY)}
 	case modeNative:
 		return []modeGroup{native(unix.XDP_ZEROCOPY, unix.XDP_COPY)}
+	case modeNativeCopy:
+		return []modeGroup{native(unix.XDP_COPY)}
 	default: // modeAuto
 		return []modeGroup{native(unix.XDP_ZEROCOPY, unix.XDP_COPY), generic}
 	}

@@ -1021,6 +1021,7 @@ Everything is configured with functional options on `Open`:
 | `WithTxFrames(n)` | buffers reserved for transmit (default half) |
 | `WithRingSize(n)` | all four ring sizes, power of two (default 2048) |
 | `WithZeroCopy()` | require native zero copy, `Open` fails if unavailable |
+| `WithCopyMode()` | native attach with copy mode, also on a NIC with zero copy |
 | `WithDriverMode()` / `WithGenericMode()` | force native / generic attach (default: auto) |
 | `WithMultiBuffer()` | let packets span several frames — jumbo support, costs zero copy |
 | `WithTxReuseRxFrames()` | let a forwarder transmit the frame it received, no copy (see below) |
@@ -1030,8 +1031,8 @@ By default `Open` picks the mode for you. It tries native zero copy, then native
 copy, then generic copy, using the first the driver accepts, so you get the fast
 path on a real NIC and it still works on veth without you choosing. `Fleet.Info()`
 reports what was selected. You rarely need to override it; `WithGenericMode`
-forces generic (and never blips the link), `WithDriverMode` forces native, and
-`WithZeroCopy` requires zero copy.
+forces generic (and never blips the link), `WithDriverMode` forces native,
+`WithZeroCopy` requires zero copy, and `WithCopyMode` forces native copy mode.
 
 Heads up: native XDP reinitializes the driver's rings, so attaching or detaching
 it **blips the link**. On some 10G NICs (e.g. Intel ixgbe) the PHY then
