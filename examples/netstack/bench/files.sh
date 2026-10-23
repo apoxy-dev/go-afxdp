@@ -74,7 +74,7 @@ esac
 srv "sudo prlimit --pid \$\$ --nofile=1048576:1048576 2>/dev/null; ulimit -n 1048576 2>/dev/null; true"
 cli "ulimit -n 1048576 2>/dev/null; true"
 tgt=$TARGET; [ "$PORTS" -gt 1 ] && tgt="${TARGET%:*}:$PORT-$((PORT+PORTS-1))"
-srv "mkdir -p $OUT; sudo setsid ${SRVENV:+env $SRVENV} taskset -c 0-$((BUDGET-1)) $BIN -iface $IFACE -vlan $VLAN -ip $IP -port $PORT -ports $PORTS -mtu 1500 -mode $mode -mix '$MIX' $sflags > $OUT/$lbl.log 2>&1 < /dev/null & disown"
+srv "mkdir -p $OUT; sudo setsid ${SRVENV:+env $SRVENV} taskset -c 0-$((BUDGET-1)) $BIN -iface $IFACE -vlan $VLAN -ip $IP -port $PORT -ports $PORTS -mtu 1500 -zerocopy -mode $mode -mix '$MIX' $sflags > $OUT/$lbl.log 2>&1 < /dev/null & disown"
 for _ in $(seq 1 40); do sleep 1; srv "grep -qE 'listening' $OUT/$lbl.log" && break; done
 srv "grep -qE 'listening' $OUT/$lbl.log" || { echo "$lbl | SERVER FAILED: $(srv "tail -3 $OUT/$lbl.log" | tr '\n' ' ' | cut -c1-220)"; exit 1; }
 # The server warns when the NIC strips VLAN tags before XDP sees them (a
@@ -89,7 +89,7 @@ sleep 2
 cflags=""
 case ${CLIENT_STACK:-kernel} in
   kernel) ;;
-  netstack) cflags="-client-stack netstack -iface $IFACE -vlan $VLAN -ip $CLIENT_IP -peer-mac $SERVER_MAC -affinity=false -gomaxprocs $((QUEUES*2)) -frames 32768 -txframes 8192 -ring 8192"; tgt=$TARGET ;;
+  netstack) cflags="-client-stack netstack -zerocopy -iface $IFACE -vlan $VLAN -ip $CLIENT_IP -peer-mac $SERVER_MAC -affinity=false -gomaxprocs $((QUEUES*2)) -frames 32768 -txframes 8192 -ring 8192"; tgt=$TARGET ;;
   *) echo "CLIENT_STACK must be kernel or netstack"; exit 1 ;;
 esac
 cli "mkdir -p $OUT; rm -f $OUT/c-$lbl.log; (sudo setsid ${CLIENV:+env $CLIENV} prlimit --nofile=1048576:1048576 $BIN -client $tgt -files -workers $WORKERS -per-conn $PERCONN -mix '$MIX' ${SLOW:+-slow $SLOW} $cflags -duration ${DUR}s > $OUT/c-$lbl.log 2>&1 < /dev/null &)"

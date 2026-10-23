@@ -43,7 +43,7 @@ func main() {
 
 	// Info() reports how we're actually running: queues, mode, zero-copy,
 	// driver, frame budget — e.g.
-	//   started: eth0: 8 queues, zero-copy, native XDP, 4096x2048B frames, driver ena
+	//   started: eth0: 8 queues, copy, native XDP, 4096x2048B frames, driver ena
 	if info, err := fleet.Info(); err == nil {
 		log.Printf("started: %s", info)
 	}

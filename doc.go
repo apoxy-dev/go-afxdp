@@ -161,11 +161,11 @@ is 2x the packets for half the CPU, and 64-byte line rate from eight physical
 cores. Use WithoutAffinity to place threads yourself, WithAffinity to name the
 CPUs, or Socket.Pin to do it at a moment of your choosing.
 
-Open auto-selects the XDP mode: it tries native zero-copy, then native copy,
-then generic copy, using the first the driver accepts, so you get the fast path
-on a real NIC and it still works on veth. Fleet.Info reports the choice. Override
-it only if needed with WithDriverMode, WithGenericMode, WithZeroCopy, or
-WithCopyMode. (Native XDP reinitializes the driver's rings, so attaching it
+Open binds copy mode: it tries native copy, then generic copy, using the first
+the driver accepts, so it works on a real NIC and on veth. It never binds
+zero-copy unless you pass WithZeroCopy, which fails if the driver cannot give
+it. Fleet.Info reports the choice. WithDriverMode and WithGenericMode force one
+attach mode. (Native XDP reinitializes the driver's rings, so attaching it
 briefly blips the link.)
 The other options (WithFrameSize, WithNumFrames, WithRingSize) tune the UMEM and
 rings.
@@ -187,10 +187,9 @@ restarting after an unclean exit just works.
 
 AF_XDP needs CAP_NET_RAW (or root) and enough locked memory for the BPF maps
 and UMEM (raise RLIMIT_MEMLOCK, e.g. ulimit -l). Native-driver (XDP_FLAGS_DRV_MODE)
-zero-copy requires driver support; otherwise the kernel falls back to generic
-(SKB) mode, which still works but is slower. Confirm zero-copy with
-Socket.ZeroCopy after binding — some drivers need page-sized FrameSize (4096)
-and a reduced MTU before they will grant it. Open sets FrameSize to 4096
-automatically on AWS ENA.
+mode requires driver support; otherwise Open falls back to generic (SKB) mode,
+which still works but is slower. Zero-copy (WithZeroCopy) also requires driver
+support — some drivers need page-sized FrameSize (4096) and a reduced MTU
+before they will grant it. Open sets FrameSize to 4096 automatically on AWS ENA.
 */
 package afxdp

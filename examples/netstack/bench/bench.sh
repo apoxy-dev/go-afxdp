@@ -41,7 +41,7 @@ stop_server() { pkill -INT -x netstack 2>/dev/null; for _ in $(seq 1 10); do pgr
 
 start_server() { # $1 = mode
   stop_server
-  setsid "$BIN" -iface "$IFACE" -vlan "$VLAN" -ip "$IP" -port "$PORT" -mode "$1" -mtu 1500 \
+  setsid "$BIN" -iface "$IFACE" -vlan "$VLAN" -ip "$IP" -port "$PORT" -mode "$1" -mtu 1500 -zerocopy \
     "${server_flags[@]}" > "$OUT/$label-$1.log" 2>&1 < /dev/null &
   disown
   for _ in $(seq 1 "$LINKWAIT"); do sleep 1; grep -q "listening" "$OUT/$label-$1.log" && break; done

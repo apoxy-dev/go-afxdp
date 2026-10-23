@@ -9,7 +9,7 @@ import "github.com/atoonk/go-afxdp"
 ```
 
 It binds every rx queue for you, installs an in-kernel filter so you only take
-the traffic you want, auto-selects zero copy where the driver supports it, and is
+the traffic you want, binds copy mode by default with zero copy one option away, and is
 safe to drive from a receive and a transmit goroutine at once. It is a
 friendlier, concurrency-safe fork of [`asavie/xdp`](https://github.com/asavie/xdp).
 
@@ -1020,19 +1020,19 @@ Everything is configured with functional options on `Open`:
 | `WithFrameSize(n)` | bytes per buffer (default 2048; auto **4096** on ENA for zero copy) |
 | `WithTxFrames(n)` | buffers reserved for transmit (default half) |
 | `WithRingSize(n)` | all four ring sizes, power of two (default 2048) |
-| `WithZeroCopy()` | require native zero copy, `Open` fails if unavailable |
-| `WithCopyMode()` | native attach with copy mode, also on a NIC with zero copy |
-| `WithDriverMode()` / `WithGenericMode()` | force native / generic attach (default: auto) |
+| `WithZeroCopy()` | require native zero copy, `Open` fails if unavailable (default: copy) |
+| `WithDriverMode()` / `WithGenericMode()` | force native / generic attach with copy (default: native, then generic) |
 | `WithMultiBuffer()` | let packets span several frames — jumbo support, costs zero copy |
 | `WithTxReuseRxFrames()` | let a forwarder transmit the frame it received, no copy (see below) |
 | `WithOptions(o)` | drop in a full `Options` struct, then override fields |
 
-By default `Open` picks the mode for you. It tries native zero copy, then native
-copy, then generic copy, using the first the driver accepts, so you get the fast
-path on a real NIC and it still works on veth without you choosing. `Fleet.Info()`
-reports what was selected. You rarely need to override it; `WithGenericMode`
-forces generic (and never blips the link), `WithDriverMode` forces native,
-`WithZeroCopy` requires zero copy, and `WithCopyMode` forces native copy mode.
+By default `Open` binds copy mode. It tries native copy, then generic copy, using
+the first the driver accepts, so it works on a real NIC and on veth without you
+choosing. It never binds zero copy unless you pass `WithZeroCopy`, which fails if
+the driver cannot give it. `Fleet.Info()` reports what was selected.
+`WithGenericMode` forces generic copy (and never blips the link) and
+`WithDriverMode` forces native copy. These three options each pick one mode; if
+you pass more than one, the last one wins.
 
 Heads up: native XDP reinitializes the driver's rings, so attaching or detaching
 it **blips the link**. On some 10G NICs (e.g. Intel ixgbe) the PHY then
@@ -1042,7 +1042,7 @@ startup; that is the link relinking, not a hang. (The `blast` example waits for
 the link to come up first, for exactly this reason.) `WithGenericMode` does not
 reset the link, which is handy for quick local tests.
 
-`WithFrameSize(4096)` gives zero copy on drivers that need page-sized frames;
+`WithFrameSize(4096)` lets `WithZeroCopy` work on drivers that need page-sized frames;
 Open already applies it on AWS ENA (see below), so you rarely set it by hand.
 Each socket has its own UMEM of `NumFrames * FrameSize` bytes, so memory scales
 with the queue count; size `NumFrames` accordingly on many-queue NICs.
@@ -1142,11 +1142,11 @@ any counter showing it. `Fleet.Info()` tells you which mode you got; if it says
    ethtool -L ens5 combined 2
    ```
 
-**Zero copy** on ENA additionally needs page-sized (4096-byte) UMEM frames — with
-the default 2048 the bind silently drops to native *copy* mode. Open handles this
-for you: when it sees the `ena` driver it defaults `FrameSize` to 4096, so once
-the MTU is right the banner reads `zero-copy, native XDP` with no code
-change. (Pass `WithFrameSize` yourself only to override that. It costs twice the
+**Zero copy** on ENA (`WithZeroCopy()`) additionally needs page-sized (4096-byte)
+UMEM frames — with the default 2048 the driver refuses it. Open handles this for
+you: when it sees the `ena` driver it defaults `FrameSize` to 4096, so once the
+MTU is right `WithZeroCopy()` gives a `zero-copy, native XDP` banner with no
+other change. (Pass `WithFrameSize` yourself only to override that. It costs twice the
 UMEM per queue, which is why 4096 is an ena-only default, not the global one.)
 
 These `ethtool`/`ip` settings are per-boot; re-apply after a reboot. They are NIC
@@ -1183,10 +1183,11 @@ xsk.RecyclePackets(pkts)
 
 **The trade-off:** a device reports its multi-buffer zero-copy limit as
 `xdp-zc-max-segs`. Where that is 1 — which is every ENA today — the kernel
-refuses an `XDP_USE_SG` bind in zero-copy mode, so `Open` settles for native
-*copy*. On ENA you get jumbo **or** zero-copy, never both. Native copy still
-beats the generic fallback comfortably, but if you don't need jumbo frames,
-lowering the MTU and leaving this option off is faster. Check `Info().ZeroCopy`.
+refuses an `XDP_USE_SG` bind in zero-copy mode, so `WithZeroCopy` fails and
+native *copy* is the only choice. On ENA you get jumbo **or** zero-copy, never
+both. Native copy still beats the generic fallback comfortably, but if you don't
+need jumbo frames, lowering the MTU, leaving this option off and passing
+`WithZeroCopy` is faster.
 
 **On AWS this needs a driver patch.** A stale compile probe in the ENA driver
 disables multi-buffer on current kernels, so XDP still won't attach at MTU 9001
@@ -1201,10 +1202,10 @@ over the private subnet, 64-byte frames), showing why the mode matters:
 | generic XDP (no setup) | 9001 | 4.89M, ~2% loss | — |
 | native, copy (`WithMultiBuffer`) | 9001 | 4.29M | 0.375 µs |
 | native, copy (`WithMultiBuffer`) | 3000 | 4.96M | 0.349 µs |
-| native + zero copy (auto 4096 frames) | 3000 | **5.00M**, 0.16% loss | 0.280 µs |
+| native + zero copy (`WithZeroCopy`, auto 4096 frames) | 3000 | **5.00M**, 0.16% loss | 0.280 µs |
 
-With the MTU set and the auto-4096 frames giving a `zero-copy, native XDP`
-banner, `blast → drop` runs a **clean, steady 5.0M pps** end to end.
+With the MTU set, `WithZeroCopy` and the auto-4096 frames giving a `zero-copy,
+native XDP` banner, `blast → drop` runs a **clean, steady 5.0M pps** end to end.
 
 Three things that table will mislead you about if you read it too quickly:
 
@@ -1394,9 +1395,9 @@ If you need the low-level pieces, `NewProgram`, `NewSocket`, and `Program.Attach
 ## Requirements
 
 AF_XDP needs `CAP_NET_RAW` (or root) and enough locked memory for the BPF maps and
-UMEM (raise `RLIMIT_MEMLOCK`, e.g. `ulimit -l`). `Open` picks native zero copy
-when the driver supports it and otherwise falls back automatically, so you do not
-have to, and `Fleet.Info()` shows what you got. On AWS ENA, zero copy additionally
+UMEM (raise `RLIMIT_MEMLOCK`, e.g. `ulimit -l`). `Open` binds native copy mode
+when the driver supports it and otherwise falls back to generic copy, and
+`Fleet.Info()` shows what you got. Zero copy needs `WithZeroCopy()`. On AWS ENA, zero copy additionally
 needs page-sized frames (Open defaults `FrameSize` to 4096 there automatically)
 and a non-jumbo MTU, since the driver caps XDP MTU at 3502 (`ip link set ens5 mtu
 1500`). Driver versions before 2.17.0 also need halved channels. See the AWS EC2 /

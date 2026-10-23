@@ -83,6 +83,7 @@ func main() {
 	useGRO := flag.Bool("gro", true, "netstack: coalesce bursts of received segments before they enter the stack")
 	useGSO := flag.Bool("gso", true, "netstack: segmentation offload — TCP hands the endpoint 64 KiB packets and it splits them")
 	needWakeup := flag.Bool("needwakeup", true, "bind with XDP_USE_NEED_WAKEUP so a zero-copy driver needs no syscall per transmit batch")
+	zeroCopy := flag.Bool("zerocopy", false, "bind the AF_XDP sockets in zero-copy mode; startup fails if the driver refuses it (default: copy mode)")
 	busyPoll := flag.Int("busypoll", 0, "kernel busy-poll microseconds for the AF_XDP sockets (0 = off)")
 	maxProcs := flag.Int("gomaxprocs", 0, "GOMAXPROCS for the server (0 = Go default)")
 	stacksMode := flag.String("stacks", "per-queue", "netstack: per-queue (one independent stack per NIC queue, shared-nothing) or single (one stack over all queues)")
@@ -120,7 +121,7 @@ func main() {
 
 	applyForkFlags()
 	rxFrames, txFramesN, ringN = *frames, *txFrames, *ringSize
-	fleetTune = fleetTuning{needWakeup: *needWakeup, busyPollUsecs: *busyPoll, noAutoTune: !*autoTune}
+	fleetTune = fleetTuning{needWakeup: *needWakeup, busyPollUsecs: *busyPoll, noAutoTune: !*autoTune, zeroCopy: *zeroCopy}
 	deferKicksFlag = *deferKicks
 	txCsumMode = *txCsum
 	fleetTune.noAffinity = !*affinity
@@ -514,6 +515,7 @@ type fleetTuning struct {
 	busyPollUsecs int
 	noAutoTune    bool
 	noAffinity    bool
+	zeroCopy      bool
 }
 
 // portList is the ports a server binds: -ports of them, from port up.
@@ -593,6 +595,9 @@ func startNetstack(iface string, vlan uint16, prefix netip.Prefix, port uint16, 
 	if fleetTune.noAffinity {
 		opts = append(opts, afxdp.WithoutAffinity())
 	}
+	if fleetTune.zeroCopy {
+		opts = append(opts, afxdp.WithZeroCopy())
+	}
 	if offload {
 		opts = append(opts, afxdp.WithTxMetadata())
 	}
@@ -611,6 +616,10 @@ func startNetstack(iface string, vlan uint16, prefix netip.Prefix, port uint16, 
 	opts = append(opts, extra...)
 	fleet, err := afxdp.Open(iface, opts...)
 	if err != nil {
+		if fleetTune.zeroCopy {
+			// The commonest refusal on this rig: an MTU larger than one frame receives.
+			return nil, fmt.Errorf("open %s: %v (zero-copy needs an MTU no larger than the frame size less 256 bytes)", iface, err)
+		}
 		return nil, fmt.Errorf("open %s: %v", iface, err)
 	}
 	if cacheBytes > 0 {
@@ -629,23 +638,9 @@ func startNetstack(iface string, vlan uint16, prefix netip.Prefix, port uint16, 
 	if info, err := fleet.Info(); err == nil {
 		log.Printf("%s", info)
 	}
-	// A socket that is not zero-copy costs a copy per frame in softirq and
-	// none of the README's numbers apply. The commonest reason on this rig
-	// was an MTU larger than one frame receives (MaxPacket), which mlx5
-	// refuses silently; say so, since the mode is one word in a long line.
-	if socks := fleet.Sockets(); len(socks) > 0 {
-		if zc, err := socks[0].ZeroCopy(); err == nil && !zc {
-			info, _ := fleet.Info()
-			switch {
-			case strings.Contains(fmt.Sprint(info), "generic"):
-				// asked for (tests on veth); nothing to say
-			case ifi.MTU > socks[0].MaxPacket():
-				log.Printf("WARNING: %s bound in copy mode: its MTU %d is more than the %d bytes one %d-byte frame receives, and the driver refuses zero-copy for it; ip link set %s mtu %d (or use larger frames)",
-					iface, ifi.MTU, socks[0].MaxPacket(), socks[0].FrameSize(), iface, socks[0].MaxPacket())
-			default:
-				log.Printf("WARNING: %s bound in copy mode: the driver refused a zero-copy socket; throughput and CPU will not match the README", iface)
-			}
-		}
+	// The README's numbers are zero-copy; say so, since the mode is one word in a long line.
+	if !fleetTune.zeroCopy {
+		log.Printf("%s bound in copy mode; pass -zerocopy for the README's numbers", iface)
 	}
 	log.Printf("waiting for the link (a native XDP attach bounces it)...")
 	if !fleet.WaitLinkUp(15 * time.Second) {

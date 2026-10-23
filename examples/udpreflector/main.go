@@ -46,8 +46,8 @@ func main() {
 	flag.Parse()
 
 	// One call: attach an XDP UDP-port filter, bind the queues, register
-	// sockets. The XDP mode is auto-selected (native zero-copy where available,
-	// falling back to generic on virtual devices like veth).
+	// sockets. The sockets bind copy mode (native where the driver has it,
+	// generic on other devices); afxdp.WithZeroCopy would demand zero-copy.
 	//
 	// The returned Fleet is a collection of AF_XDP sockets (XSKs) — one per
 	// rx/tx queue — i.e. the set of per-queue workers we'll run below, one
@@ -71,7 +71,7 @@ func main() {
 		log.Printf("warning: link not up after 15s; continuing anyway")
 	}
 	if info, err := fleet.Info(); err == nil {
-		log.Print(info) // e.g. eth0: 4 queues, zero-copy, native XDP, 4096x2048B frames
+		log.Print(info) // e.g. eth0: 4 queues, copy, native XDP, 4096x2048B frames
 	}
 
 	for q, xsk := range fleet.Sockets() {

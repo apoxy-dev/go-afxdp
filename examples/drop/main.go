@@ -46,10 +46,11 @@ func main() {
 		"run the workers on these processors instead of the ones chosen automatically, e.g. 4,6,8 or 4-7 (see WithAffinity)")
 	keepMgmt := flag.Bool("keep-management", false,
 		"with -all, leave ARP/ND/SSH/DNS with the kernel so you keep your session")
+	zeroCopy := flag.Bool("zerocopy", false, "bind in zero-copy mode; Open fails if the driver cannot give it (default: copy mode)")
 	flag.Parse()
 
 	// Filter to the one UDP port so only the flood reaches userspace; the rest
-	// of the host's traffic stays with the kernel. Mode is auto-selected.
+	// of the host's traffic stays with the kernel. Copy mode unless -zerocopy.
 	// WithReceiveHeavy because this is a pure sink: it never transmits, so give
 	// the whole UMEM to the receive pool instead of reserving half for tx.
 	filter := afxdp.WithUDPPorts(uint16(*port))
@@ -72,6 +73,9 @@ func main() {
 		// Only meaningful with -all: capturing everything on the interface you
 		// administer the box through takes your own SSH session with it.
 		opts = append(opts, afxdp.WithKeepManagement())
+	}
+	if *zeroCopy {
+		opts = append(opts, afxdp.WithZeroCopy())
 	}
 	fleet, err := afxdp.Open(*iface, opts...)
 	if err != nil {

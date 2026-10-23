@@ -17,7 +17,7 @@ lbl=$1; mode=$2; shift 3
 # Graceful stop first, and wait for it: go-afxdp restores the NAPI sysctls and
 # IRQ steering only on a clean Close, and a SIGKILL leaves them behind.
 pkill -INT -x netstack 2>/dev/null; for _ in $(seq 1 10); do pgrep -x netstack >/dev/null || break; sleep 1; done; pkill -9 -x netstack 2>/dev/null; sleep 1
-setsid "${BIN:-$(dirname "$0")/../netstack}" -iface eno2 -vlan 2131 -ip 192.168.0.1/24 -port 8080 -mtu 1500 -mode $mode ${SRV:-} > $S/m-$lbl.log 2>&1 < /dev/null & disown
+setsid "${BIN:-$(dirname "$0")/../netstack}" -iface eno2 -vlan 2131 -ip 192.168.0.1/24 -port 8080 -mtu 1500 -zerocopy -mode $mode ${SRV:-} > $S/m-$lbl.log 2>&1 < /dev/null & disown
 for w in $(seq 1 26); do sleep 1; grep -q listening $S/m-$lbl.log && break; done
 ssh -o BatchMode=yes $C "rm -f /root/c.log; (setsid /root/netstack -client 192.168.0.1:8080 -duration 12s $* > /root/c.log 2>&1 < /dev/null &)"
 for w in $(seq 1 40); do sleep 1; ssh -o BatchMode=yes $C "grep -q 'client:' /root/c.log" && break; done

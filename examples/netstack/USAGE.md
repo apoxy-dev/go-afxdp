@@ -57,14 +57,14 @@ own module so the core library keeps its small dependency set.
 - **The address belongs to the kernel.** The stack answers no ARP; the
   kernel does, because it owns the address on the interface or its VLAN
   sub-interface. Configure it there first.
-- **MTU no larger than one frame receives.** A 2048-byte frame receives
-  1792 bytes (`Socket.MaxPacket`: the frame less the kernel's 256-byte
-  headroom); mlx5 silently refuses a zero-copy socket for an interface
-  whose MTU is larger, and go-afxdp falls back to copy mode, which costs a
-  copy per frame in softirq and halves the connection rate. The server
-  prints a `WARNING` naming the MTU and the limit when that happens, and
-  `bench/files.sh` refuses to measure a server that warned. Keep eno2 at
-  1500, or use `-frames` with larger frames.
+- **`-zerocopy`, and an MTU no larger than one frame receives.** The
+  sockets bind copy mode unless `-zerocopy` is set, and copy mode costs a
+  copy per frame in softirq and halves the connection rate. A 2048-byte
+  frame receives 1792 bytes (`Socket.MaxPacket`: the frame less the
+  kernel's 256-byte headroom); mlx5 refuses a zero-copy socket for an
+  interface whose MTU is larger, and with `-zerocopy` the program then
+  exits with an error. The scripts in `bench/` pass `-zerocopy`. Keep eno2
+  at 1500, or use `-frames` with larger frames.
 - **VLAN offload off**, or XDP never sees the tag and every frame is
   dropped as the wrong VLAN (the program warns at startup):
   ```
@@ -400,6 +400,7 @@ The commands, in order, that the README's 100G section was run with:
 | `-rxcsum` | `verify` (default) or `trust` the NIC's receive checksums instead of re-validating in software; a measurement knob (it changed nothing at 100G) |
 | `-txcsum` | TCP checksum on transmit: `auto` (default: NIC offload through XDP transmit metadata when the driver reports it, else software), `on`, `off` |
 | `-needwakeup` | bind with `XDP_USE_NEED_WAKEUP` so a zero-copy driver needs no syscall per transmit batch (default on) |
+| `-zerocopy` | bind the AF_XDP sockets in zero-copy mode; startup fails if the driver refuses it (default off: copy mode) |
 | `-frames`, `-txframes`, `-ring` | UMEM frames per queue (16384), of which reserved for transmit (8192), and ring depth (4096); a GSO batch can need 2200 transmit frames |
 | `-stacks` | `per-queue` (default: one independent netstack per NIC queue, shared-nothing) or `single` (one stack over all queues) |
 | `-deferkicks` | queue transmits without a kick; each receive goroutine kicks its socket once per batch (default on) |

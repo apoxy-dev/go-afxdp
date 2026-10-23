@@ -970,14 +970,14 @@ func TestNamespacedVeth(t *testing.T) {
 func TestModeOptions(t *testing.T) {
 	cases := []struct {
 		name     string
-		opt      Option
+		opts     []Option
 		wantErr  bool
 		wantMode string
 	}{
-		{name: "copy", opt: WithCopyMode(), wantMode: "native"},
-		{name: "driver", opt: WithDriverMode(), wantMode: "native"},
-		{name: "generic", opt: WithGenericMode(), wantMode: "generic"},
-		{name: "zero-copy", opt: WithZeroCopy(), wantErr: true},
+		{name: "default", wantMode: "native"},
+		{name: "driver", opts: []Option{WithDriverMode()}, wantMode: "native"},
+		{name: "generic", opts: []Option{WithGenericMode()}, wantMode: "generic"},
+		{name: "zero-copy", opts: []Option{WithZeroCopy()}, wantErr: true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -985,7 +985,8 @@ func TestModeOptions(t *testing.T) {
 			if err := rlimit.RemoveMemlock(); err != nil {
 				t.Skipf("cannot raise memlock (need privileges): %v", err)
 			}
-			f, err := Open(ifA, tc.opt, WithFilter(MatchAll()), WithoutAffinity(), WithoutAutoTune())
+			opts := append([]Option{WithFilter(MatchAll()), WithoutAffinity(), WithoutAutoTune()}, tc.opts...)
+			f, err := Open(ifA, opts...)
 			if tc.wantErr {
 				if err == nil {
 					f.Close()

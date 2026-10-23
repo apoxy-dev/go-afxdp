@@ -55,7 +55,7 @@ func main() {
 	flag.Parse()
 
 	// Lift only UDP/53 into userspace; everything else stays in the kernel.
-	// Open auto-selects the XDP mode (native zero-copy where available).
+	// Open binds copy mode (native where the driver has it, else generic).
 	fleet, err := afxdp.Open(*iface,
 		afxdp.WithUDPPorts(53),
 		afxdp.WithQueues(*queues),

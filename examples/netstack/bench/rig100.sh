@@ -67,7 +67,7 @@ cleanup() { trap - EXIT INT TERM; stop srv 2>/dev/null; stop cli 2>/dev/null; re
 trap cleanup EXIT
 trap 'cleanup; exit 130' INT TERM
 confine
-srv "mkdir -p $OUT; sudo setsid $TASKSET $BIN -iface $IFACE -vlan $VLAN -ip $IP -port $PORT -mtu 1500 -mode $mode ${SRV:-} > $OUT/$lbl.log 2>&1 < /dev/null & disown"
+srv "mkdir -p $OUT; sudo setsid $TASKSET $BIN -iface $IFACE -vlan $VLAN -ip $IP -port $PORT -mtu 1500 -zerocopy -mode $mode ${SRV:-} > $OUT/$lbl.log 2>&1 < /dev/null & disown"
 for _ in $(seq 1 40); do sleep 1; srv "grep -q listening $OUT/$lbl.log" && break; done
 srv "grep -q listening $OUT/$lbl.log" || { echo "$lbl | SERVER FAILED: $(srv "tail -2 $OUT/$lbl.log" | cut -c1-200)"; exit 1; }
 sleep 2

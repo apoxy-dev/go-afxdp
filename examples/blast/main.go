@@ -14,7 +14,8 @@
 // packet so the receiver spreads the flood across its rx queues (RSS).
 //
 // It attaches a no-op XDP program (afxdp.MatchNone) purely to enable the
-// driver's zero-copy datapath for transmit; no receive traffic is touched.
+// driver's AF_XDP datapath for transmit; no receive traffic is touched. It binds
+// copy mode unless -zerocopy is set.
 //
 // WARNING: this saturates the link. Do NOT run it on your management/SSH
 // interface — line-rate TX starves the host's own traffic and you'll lose the
@@ -54,6 +55,7 @@ func main() {
 		"leave CPU placement to the scheduler instead of colocating each worker with its queue's interrupt (see WithoutAffinity)")
 	cpus := flag.String("cpus", "",
 		"run the workers on these processors instead of the ones chosen automatically, e.g. 4,6,8 or 4-7 (see WithAffinity)")
+	zeroCopy := flag.Bool("zerocopy", false, "bind in zero-copy mode; Open fails if the driver cannot give it (default: copy mode)")
 	flag.Parse()
 
 	if *dstIP == "" {
@@ -78,7 +80,7 @@ func main() {
 	log.Printf("blasting %s:%d  (%s %s -> %s %s, %d-byte frames%s)",
 		*dstIP, *dstPort, srcIP, srcMAC, dstMAC, dip, *size, vlanNote)
 
-	// Attach a no-op program (MatchNone) so we get the zero-copy TX datapath
+	// Attach a no-op program (MatchNone) so we get the AF_XDP TX datapath
 	// without stealing any receive traffic, and bind one socket per queue.
 	opts := []afxdp.Option{
 		afxdp.WithFilter(afxdp.MatchNone()),
@@ -91,6 +93,9 @@ func main() {
 		opts = append(opts, afxdp.WithoutAffinity())
 	} else if *cpus != "" {
 		opts = append(opts, afxdp.WithAffinity(parseCPUs(*cpus)...))
+	}
+	if *zeroCopy {
+		opts = append(opts, afxdp.WithZeroCopy())
 	}
 	fleet, err := afxdp.Open(*iface, opts...)
 	if err != nil {

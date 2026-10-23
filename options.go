@@ -34,8 +34,8 @@ type Options struct {
 	// FrameSize is the size in bytes of each UMEM buffer. Default 2048.
 	//
 	// For AF_XDP zero-copy on some drivers the frame size must equal the page
-	// size, i.e. 4096; with a smaller frame the bind silently falls back to
-	// copy mode. Open detects this for AWS ENA and defaults FrameSize to 4096
+	// size, i.e. 4096; with a smaller frame the driver refuses a zero-copy
+	// bind. Open detects this for AWS ENA and defaults FrameSize to 4096
 	// there automatically (unless you set it or force generic mode). On any
 	// other driver whose zero-copy bind needs page-sized chunks, set 4096 here.
 	FrameSize int
@@ -175,7 +175,7 @@ type config struct {
 	queues  int     // 0 means "all rx queues"
 	matches []Match // packet filter; empty means "redirect all packets"
 	except  []Match // user-supplied exceptions (WithExcept); passed, never redirected
-	mode    xdpMode // how to attach/bind; default modeAuto picks the best
+	mode    xdpMode // how to attach/bind; default modeAuto binds copy mode
 
 	keepManagement bool     // pass management traffic to the kernel (see WithKeepManagement)
 	mgmtTCPPorts   []uint16 // TCP ports treated as management; defaults to 22
@@ -204,25 +204,20 @@ type config struct {
 }
 
 // xdpMode selects how Open attaches the XDP program and binds the sockets.
-// The default, modeAuto, tries the fastest working combination so callers
-// don't have to reason about native vs generic or zero-copy vs copy.
+// Every mode binds copy mode, except modeNativeZC.
 type xdpMode int
 
 const (
-	// modeAuto tries native+zero-copy, then native+copy, then generic+copy,
-	// using the first that the driver accepts. This is the default.
+	// modeAuto tries native+copy, then generic+copy, using the first that the
+	// driver accepts. This is the default.
 	modeAuto xdpMode = iota
-	// modeNative forces native (driver) XDP; zero-copy if the driver supports
-	// it, otherwise copy.
+	// modeNative forces native (driver) XDP with copy mode.
 	modeNative
 	// modeNativeZC requires native zero-copy; Open fails if it isn't available.
 	modeNativeZC
 	// modeGeneric forces generic (SKB) XDP with copy semantics. Slower, but
 	// works anywhere — including veth and other virtual devices.
 	modeGeneric
-	// modeNativeCopy forces native (driver) XDP with copy semantics, also when
-	// the driver supports zero-copy.
-	modeNativeCopy
 )
 
 func newConfig(opts ...Option) config {
@@ -298,29 +293,23 @@ func WithRingSize(n int) Option {
 	}
 }
 
-// By default Open auto-selects the XDP mode (native zero-copy, falling back to
-// native copy, then generic copy). The options below override that only when
-// you have a specific need; most callers should not set any of them.
+// By default Open binds copy mode (native copy, falling back to generic copy).
+// Zero-copy is never used unless you ask for it with WithZeroCopy. The three
+// options below each pick one mode; the last one passed wins.
 
 // WithZeroCopy requires native zero-copy mode: Open fails if the driver can't
-// provide it. Use this when you must know you're getting the fast path.
+// provide it. It is the only way to get zero-copy.
 func WithZeroCopy() Option { return func(c *config) { c.mode = modeNativeZC } }
 
-// WithDriverMode forces native (driver) XDP, using zero-copy when the driver
-// supports it and copy otherwise. Native XDP reinitializes the driver's queues,
-// which briefly blips the link on attach and detach.
+// WithDriverMode forces native (driver) XDP with copy mode. Native XDP
+// reinitializes the driver's queues, which briefly blips the link on attach
+// and detach.
 func WithDriverMode() Option { return func(c *config) { c.mode = modeNative } }
 
 // WithGenericMode forces generic (SKB) XDP with copy semantics. It is slower
 // and never zero-copy, but works on any interface — including veth and other
 // virtual devices that have no native XDP — and does not blip the link.
 func WithGenericMode() Option { return func(c *config) { c.mode = modeGeneric } }
-
-// WithCopyMode forces native (driver) XDP and binds the sockets with XDP_COPY,
-// so the kernel copies each frame also when the driver supports zero-copy.
-// Open fails if the driver has no native XDP. Use it to compare copy mode with
-// zero-copy on the same NIC.
-func WithCopyMode() Option { return func(c *config) { c.mode = modeNativeCopy } }
 
 // WithNeedWakeup binds with XDP_USE_NEED_WAKEUP, letting the driver stop polling
 // when it has no receive buffers (or nothing to transmit) and wait to be woken.
@@ -380,9 +369,9 @@ func WithBusyPoll(usecs, budget int) Option {
 //
 // The cost is zero-copy. A device reports its multi-buffer zero-copy limit as
 // xdp-zc-max-segs; where that is 1 (AWS ENA today) the kernel refuses an
-// XDP_USE_SG bind in zero-copy mode, so Open settles for native copy mode.
-// Check Info().ZeroCopy if that matters to you — on such a NIC, lowering the
-// MTU and leaving this option off is faster than turning it on.
+// XDP_USE_SG bind in zero-copy mode, so WithZeroCopy fails there and the
+// default copy mode is the only choice. On such a NIC, lowering the MTU,
+// leaving this option off and passing WithZeroCopy is faster.
 func WithMultiBuffer() Option {
 	return func(c *config) {
 		c.multiBuffer = true

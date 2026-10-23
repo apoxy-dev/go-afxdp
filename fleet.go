@@ -102,11 +102,10 @@ func CountQueues(iface string) (int, error) {
 // / WithFilter to capture specific traffic, WithFilter(MatchAll()) to take
 // everything on purpose, or WithFilter(MatchNone()) for transmit-only.
 //
-// Open auto-selects the XDP mode: it tries native zero-copy, then native copy,
-// then generic copy, using the first the driver accepts. You don't have to
-// reason about modes; check Fleet.Info to see which was chosen. Override with
-// WithDriverMode, WithGenericMode, WithZeroCopy, or WithCopyMode only if you
-// have a need.
+// Open binds the sockets in copy mode: it tries native copy, then generic copy,
+// using the first the driver accepts. It never binds zero-copy unless you pass
+// WithZeroCopy. Check Fleet.Info to see which mode was chosen. WithDriverMode
+// and WithGenericMode force one attach mode.
 //
 // On any error it cleans up whatever it already created. Each socket gets its
 // own UMEM of NumFrames*FrameSize bytes, so total memory scales with the queue
@@ -118,12 +117,12 @@ func Open(iface string, opts ...Option) (*Fleet, error) {
 	}
 	base := cfg.opts.withDefaults()
 
-	// AWS ENA's zero-copy datapath requires page-sized (4096-byte) UMEM frames;
-	// with the default 2048 the bind silently falls back to native *copy* mode.
-	// When the caller hasn't chosen a frame size and native/zero-copy is still on
-	// the table, default to 4096 on ena so zero-copy works out of the box. Skipped
-	// for forced generic mode (zero-copy is impossible there, so the bigger frames
-	// would only waste UMEM); an explicit WithFrameSize always wins.
+	// AWS ENA's zero-copy datapath requires page-sized (4096-byte) UMEM frames,
+	// and in native copy mode a 2048-byte frame cannot hold a packet at an ENA
+	// XDP MTU above 2048. So when the caller hasn't chosen a frame size and the
+	// attach can be native, default to 4096 on ena. Skipped for forced generic
+	// mode, where the bigger frames would only waste UMEM; an explicit
+	// WithFrameSize always wins.
 	if cfg.opts.FrameSize == 0 && cfg.mode != modeGeneric && interfaceDriver(iface) == "ena" {
 		base.FrameSize = 4096
 	}
@@ -187,7 +186,7 @@ func Open(iface string, opts ...Option) (*Fleet, error) {
 
 	// Try each attach mode in preference order. For a given attach mode we
 	// attach the program once (native attach blips the link), then try its
-	// bind variants (zero-copy before copy) without re-attaching.
+	// bind variants without re-attaching.
 	var lastErr error
 	for _, g := range modeGroups(cfg.mode) {
 		prog, err := buildProgram(nQueues, exceptions, cfg.matches, cfg.multiBuffer, cfg.program)
@@ -322,11 +321,9 @@ func modeGroups(m xdpMode) []modeGroup {
 	case modeNativeZC:
 		return []modeGroup{native(unix.XDP_ZEROCOPY)}
 	case modeNative:
-		return []modeGroup{native(unix.XDP_ZEROCOPY, unix.XDP_COPY)}
-	case modeNativeCopy:
 		return []modeGroup{native(unix.XDP_COPY)}
 	default: // modeAuto
-		return []modeGroup{native(unix.XDP_ZEROCOPY, unix.XDP_COPY), generic}
+		return []modeGroup{native(unix.XDP_COPY), generic}
 	}
 }
 
